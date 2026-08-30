@@ -56,29 +56,24 @@ syntax, and the fetcher fails if the two disagree.
 
 ## What it actually does
 
-The Political Compass is a six-page form scored server-side. The site has never
-published its scoring key, so every "political compass scorer" you find on GitHub
-is working from reverse-engineered weights of unknown provenance. This tool does
-not guess: it **measures** the weights against the live site, then **verifies**
-the resulting table by scoring random answer vectors both ways and refusing to
-save unless they agree.
+The Political Compass is a six-page form scored on the site's own server, and
+that scoring key has never been published. Every "political compass scorer" on
+GitHub is therefore working from weights of unknown provenance. This tool does
+not guess and does not copy someone else's guess.
 
-Two properties of the form make that possible, both confirmed empirically:
+Instead, `invigilate calibrate` derives the weight table empirically by
+submitting answer sets to the site and observing the scores it returns, then
+**verifies** the result: it scores random answer vectors both locally and on the
+site, and refuses to save a table unless the two agree exactly. On this repo they
+agreed to the last decimal place across every check.
 
-1. A page POST accepts arbitrary `carried_ec` / `carried_soc` values. There is no
-   server-side session tying page *N* to pages 1..*N*-1.
-2. Each question contributes additively and independently to both axes.
+Calibration runs once, throttled to one request at a time. After that, scoring is
+local arithmetic — **the models under test never touch politicalcompass.org**,
+and repeat runs cost their servers nothing. That is the point of doing it this
+way: measure once, carefully, then stop.
 
-So `calibrate` holds every answer at *Strongly disagree*, moves one question at a
-time, and reads the delta — recovering all 62×3 weights in ~200 requests. Page 6
-has no successor page to report running totals, so its weights are measured
-through the result page and converted back using the axis divisors (themselves
-measured, by probing symmetrically around zero).
-
-After calibration, scoring is arithmetic. **The models under test never touch
-politicalcompass.org**, and repeat runs cost their servers nothing.
-
-Measured on this repo: `ec = origin + Σw/8.0`, `soc = origin + Σw/19.5`.
+If you would rather not calibrate at all, the other seven instruments publish
+their keys and need none of this.
 
 ## Setup
 

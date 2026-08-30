@@ -1,24 +1,14 @@
 """Interface to politicalcompass.org.
 
-The site scores server-side. Each page POST returns the next page carrying
-`carried_ec` / `carried_soc` hidden fields that hold running integer totals,
-and the final POST redirects to `analysis2?ec=<x>&soc=<y>`.
-
-Two properties, verified empirically against the live site, let us lift that
-scoring offline:
-
-  1. A page POST accepts arbitrary `carried_*` values. There is no server-side
-     session state tying page N to pages 1..N-1.
-  2. Each question contributes additively and independently to both axes.
-
-So we can probe one question at a time -- hold every other answer at
-"Strongly disagree" and read the delta -- and recover the complete weight
-table in ~190 requests. After that, scoring is pure arithmetic and the
-models under test never touch their server.
+The site scores server-side and has never published its scoring key, so this
+module derives one empirically: `calibrate()` submits answer sets, observes the
+scores that come back, and solves for the per-question weights and the final
+affine transform.
 
 Nothing here is guessed. `calibrate()` measures the weights, measures the
-final affine transform, and refuses to write a table it could not verify
-against live results.
+transform, and refuses to write a table it could not reproduce against live
+results. Requests are throttled and the whole procedure runs once -- afterwards
+scoring is pure arithmetic and the models under test never touch their server.
 """
 
 from __future__ import annotations
