@@ -1,0 +1,25 @@
+# Secrets -- never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Generated: questionnaire content belongs to its publishers, not this repo.
+# Rebuild with `invigilate fetch`.
+instruments/*.json
+data/questions.json
+data/weights.json
+
+# Run artefacts: contain full model transcripts under --trace
+results/
+*.log
+
+.DS_Store

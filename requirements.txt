@@ -1,0 +1,3 @@
+# Only the Anthropic adapter needs an SDK; every other provider is plain HTTP
+# against its REST endpoint, and the compass client is stdlib urllib.
+anthropic>=0.40

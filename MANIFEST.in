@@ -1,0 +1,3 @@
+exclude .env
+recursive-exclude instruments *.json
+recursive-exclude results *
