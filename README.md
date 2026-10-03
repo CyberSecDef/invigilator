@@ -114,6 +114,21 @@ is refused).
 | `xai` | OpenAI-compatible | `grok-4.6` |
 | `gemini` | `generativelanguage` REST | `gemini-3.7-flash` |
 | `ollama` | `/api/chat`, local | `gemma4:26b` |
+| `typesafe` | `/v1/systemone`, Score questions | `jev-latest` |
+
+`typesafe` is a judgement model, not a chat model: each item goes out as a
+Score question whose levels are the instrument's response labels, and comes
+back as a probability distribution, with no text to parse. The most probable
+level is the answer that gets scored, so results compare directly with the
+other providers. Each item's distribution is also saved, and the whole run is
+scored from those as `score_expected`: trait means use each item's expected
+value, and the compass uses each item's probability-weighted calibrated weight
+(its weights are not linear in the answer, so the expected value alone would
+be wrong). Jev is not deterministic. Probabilities drift by a few hundredths
+between calls, which is enough to flip a near-tie pick, so keep `--repeats`.
+The weighted score barely moves when that happens. Two more differences: it
+cannot refuse, so its refusal count is zero by construction, and it runs in
+isolated mode only. Key: `TYPESAFE_API_KEY`.
 
 ## The two modes, and why
 

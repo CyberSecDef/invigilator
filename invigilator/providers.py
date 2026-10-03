@@ -4,6 +4,7 @@ Anthropic goes through the official `anthropic` SDK. The OpenAI-compatible
 providers (OpenAI, DeepSeek, xAI) share one adapter, and Gemini and Ollama get
 thin ones of their own -- all over plain HTTP, since this file is deliberately
 provider-neutral and pulling six vendor SDKs in would not make it clearer.
+TypeSafe is the odd one out: it answers typed questions rather than prompts.
 
 Every adapter returns the same `Reply`, and none of them retries on a refusal:
 a refusal is a measurement, not an error.
@@ -107,6 +108,8 @@ class Provider:
     # limit after tripping it; on an RPM-capped free tier that degenerates into
     # every request failing once. Pacing up front avoids the limit entirely.
     min_interval: float = 0.0
+    # True for judgement models that take typed questions instead of a prompt.
+    structured: bool = False
 
     def __init__(self):
         self._gate = threading.Lock()
@@ -342,6 +345,35 @@ class Ollama(Provider):
         return sorted(m["name"] for m in data.get("models", []))
 
 
+class TypeSafe(Provider):
+    """TypeSafe's System One models (Jev).
+
+    These return typed judgements with probabilities, not text, so there is
+    nothing for `complete()` to do: survey.py sees `structured` and asks each
+    item as a Score question through `judge()` instead. Jev cannot refuse --
+    every question gets a distribution -- so a TypeSafe run's refusal count is
+    zero by construction, not by disposition.
+    """
+
+    name = "typesafe"
+    key_env = "TYPESAFE_API_KEY"
+    default_model = "jev-latest"
+    structured = True
+    base_url = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai/v1").rstrip("/")
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {os.environ.get(self.key_env, '')}"}
+
+    def _complete(self, model, system, user, max_tokens):
+        raise ProviderError("typesafe models answer typed questions, not prompts", status=400)
+
+    def judge(self, model: str, state: dict, questions: dict) -> dict:
+        """One /systemone request. Returns the raw response body."""
+        self._pace()
+        payload = {"model": model, "state": state, "questions": questions}
+        return _http_json(f"{self.base_url}/systemone", payload, self._headers())
+
+
 def registry() -> dict[str, Provider]:
     return {
         "anthropic": Anthropic(),
@@ -356,6 +388,7 @@ def registry() -> dict[str, Provider]:
         ),
         "gemini": Gemini(),
         "ollama": Ollama(),
+        "typesafe": TypeSafe(),
     }
 
 

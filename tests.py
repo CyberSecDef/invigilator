@@ -302,5 +302,122 @@ class ErrorsAreNotRefusals(unittest.TestCase):
         self.assertEqual(status, "refused")
 
 
+class FakeJev:
+    """Stands in for TypeSafe: answers every Score question with fixed odds."""
+
+    max_concurrency = 1
+    structured = True
+
+    def __init__(self, probabilities):
+        self.probabilities = probabilities
+        self.requests = []
+
+    def judge(self, model, state, questions):
+        self.requests.append((state, questions))
+        levels = len(questions["response"]["criteria"])
+        probs = {str(i): self.probabilities.get(i, 0.0) for i in range(levels)}
+        return {"model": "jev-test", "answers": {"response": {
+            "type": "score", "probabilities": probs, "confidence": 0.5,
+            "score": sum(i * p for i, p in self.probabilities.items())}}}
+
+
+class JudgementModels(unittest.TestCase):
+    def test_every_builtin_renders_levels_matching_its_scale(self):
+        for name in instrument.available():
+            ins = instrument.load(name)
+            for item in ins.items:
+                state, instructions, levels = ins.judgement(item)
+                self.assertEqual(len(levels), ins.points, f"{name}:{item['key']}")
+                self.assertLessEqual(len(levels), 10, "Score accepts at most 10 levels")
+                for path in state:
+                    self.assertIn(f"`{path}`", instructions, f"{name}: state {path} unused")
+
+    def test_bipolar_levels_name_the_side_they_lean_towards(self):
+        oejts = instrument.load("oejts")
+        _, _, levels = oejts.judgement(oejts.items[0])
+        self.assertIn("makes lists", levels[0])
+        self.assertIn("relies on memory", levels[-1])
+        self.assertNotIn("makes lists", levels[2])   # neutral midpoint names neither
+
+    def test_sectioned_items_use_their_sections_labels(self):
+        mfq = instrument.load("mfq")
+        judgement = next(i for i in mfq.items if i["section"] == "judgement")
+        _, instructions, levels = mfq.judgement(judgement)
+        self.assertIn("agreement or disagreement", instructions)
+        self.assertEqual(levels[-1], "strongly agree")
+
+    def test_answer_is_the_most_probable_level_not_the_rounded_mean(self):
+        compass_ins = instrument.load("political-compass")
+        # Split between Strongly disagree and Strongly agree: the mean (2.5)
+        # sits on an option nobody chose; the mode is a real answer.
+        value, expected = survey.read_judgement(
+            {"probabilities": {"0": 0.51, "1": 0, "2": 0, "3": 0.49}, "score": 1.47},
+            compass_ins)
+        self.assertEqual(value, 1)
+        self.assertAlmostEqual(expected, 2.47)
+
+    def test_answers_map_onto_zero_based_scales(self):
+        mfq = instrument.load("mfq")
+        value, _ = survey.read_judgement({"probabilities": {"0": 0.9, "1": 0.1}}, mfq)
+        self.assertEqual(value, 0)
+
+    def test_a_full_run_answers_everything_and_records_expected_positions(self):
+        sd3 = instrument.load("sd3")
+        jev = FakeJev({3: 0.7, 4: 0.3})
+        outcome = survey.run_once(jev, "jev-test", sd3, "isolated", seed=1)
+        self.assertEqual(len(outcome["answers"]), len(sd3.items))
+        self.assertEqual(set(outcome["answers"].values()), {4})
+        self.assertEqual(outcome["refused"], [])
+        self.assertAlmostEqual(outcome["expected"][sd3.items[0]["key"]], 4.3)
+        self.assertEqual(len(jev.requests), len(sd3.items), "one request per item")
+
+    def test_judgement_models_refuse_batch_mode(self):
+        with self.assertRaises(ValueError):
+            survey.run_once(FakeJev({0: 1.0}), "m", instrument.load("sd3"), "batch", seed=1)
+
+    def test_an_empty_distribution_is_an_error_not_a_refusal(self):
+        class Broken(FakeJev):
+            def judge(self, *a):
+                return {"answers": {"response": {"type": "score"}}}
+
+        ins = instrument.load("sd3")
+        answer, status, _ = survey.ask_structured(Broken({}), "m", ins, ins.items[0])
+        self.assertIsNone(answer)
+        self.assertEqual(status, "error")
+
+    def test_a_certain_distribution_scores_like_a_pick(self):
+        for name in ["political-compass", "sd3", "mfq"]:
+            ins = instrument.load(name)
+            top = ins.values()[-1]
+            picks = {k: top for k in ins.keys()}
+            certain = {k: {top: 1.0} for k in ins.keys()}
+            self.assertEqual(scoring.score(ins, picks)["point"],
+                             scoring.score_expected(ins, certain)["point"], name)
+
+    def test_compass_weights_each_option_by_its_probability(self):
+        ins = instrument.load("political-compass")
+        low = scoring.score(ins, {k: 1 for k in ins.keys()})["point"]
+        high = scoring.score(ins, {k: 4 for k in ins.keys()})["point"]
+        half = scoring.score_expected(
+            ins, {k: {1: 0.5, 4: 0.5} for k in ins.keys()})["point"]
+        for axis in ("ec", "soc"):
+            # Linear in probability, so a 50/50 split lands at the midpoint
+            # (to within the 2-decimal projection rounding).
+            self.assertAlmostEqual(half[axis], (low[axis] + high[axis]) / 2, delta=0.01)
+
+    def test_a_run_records_distributions_on_the_scale(self):
+        mfq = instrument.load("mfq")
+        outcome = survey.run_once(FakeJev({0: 0.25, 5: 0.75}), "m", mfq, "isolated", seed=1)
+        dist = outcome["distributions"][mfq.items[0]["key"]]
+        self.assertEqual(dist[0], 0.25)          # mfq's scale starts at 0
+        self.assertEqual(dist[5], 0.75)
+
+    def test_registry_marks_typesafe_as_structured(self):
+        provider, model = providers.resolve("typesafe")
+        self.assertTrue(provider.structured)
+        self.assertEqual(model, "jev-latest")
+        self.assertFalse(providers.resolve("openai")[0].structured)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -130,6 +130,8 @@ def cmd_run(args):
         provider, model = providers.resolve(spec)
         if not provider.available():
             sys.exit(f"{spec}: {provider.key_env} is not set")
+        if provider.structured and args.mode == "batch":
+            sys.exit(f"{spec}: judgement models run in isolated mode only")
         targets.append((spec, provider, model))
 
     results = []
@@ -156,6 +158,14 @@ def cmd_run(args):
                 "score": score,
                 "trace": outcome["trace"] if args.trace else None,
             })
+            if "distributions" in outcome:
+                # Judgement models report a distribution per item; score that
+                # too, alongside the top-level picks every other model gets.
+                results[-1]["expected"] = outcome["expected"]
+                results[-1]["distributions"] = outcome["distributions"]
+                results[-1]["score_expected"] = scoring.score_expected(
+                    instrument, outcome["distributions"],
+                    outcome["refused"] + outcome["errored"])
             point = score["point"]
             flags = []
             if outcome["refused"]:
@@ -169,6 +179,11 @@ def cmd_run(args):
             if instrument.report["type"] == "dichotomy":
                 summary = f"{scoring.type_code(instrument, point)} — {summary}"
             print(f"    -> {summary}{note}")
+            if "score_expected" in results[-1]:
+                weighted = results[-1]["score_expected"]["point"]
+                print("       probability-weighted: " + ", ".join(
+                    f"{instrument.traits[t]['label']} {v:+.2f}"
+                    for t, v in weighted.items() if v is not None))
             compass.save(out_path, {"generated": _stamp(), "results": results})
 
     print(f"\n{len(results)} runs -> {out_path}")

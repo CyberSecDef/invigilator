@@ -257,15 +257,23 @@ def calibrate(site: Site, schema: dict, log=print) -> dict:
 
 
 def weight_sum(table: dict, answers: dict) -> dict:
-    """Sum the per-question raw contributions, relative to all-'Strongly disagree'."""
+    """Sum the per-question raw contributions, relative to all-'Strongly disagree'.
+
+    An answer is a radio value, or a {value: probability} distribution from a
+    judgement model, which contributes its probability-weighted weight. The
+    weights are not linear in the value, so the distribution is needed -- the
+    expected value alone would not do.
+    """
     totals = {"ec": 0, "soc": 0}
     for key, value in answers.items():
         weight = table["weights"].get(key)
         if weight is None:
             raise KeyError(f"no calibrated weight for {key!r}")
-        d_ec, d_soc = weight[str(value)]
-        totals["ec"] += d_ec
-        totals["soc"] += d_soc
+        spread = value if isinstance(value, dict) else {value: 1.0}
+        for option, probability in spread.items():
+            d_ec, d_soc = weight[str(option)]
+            totals["ec"] += d_ec * probability
+            totals["soc"] += d_soc * probability
     return totals
 
 

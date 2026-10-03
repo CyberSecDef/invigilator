@@ -151,6 +151,68 @@ def ask_isolated(provider, model, instrument, item, max_nudges=3, max_errors=5, 
     return None, "refused", attempts
 
 
+def read_judgement(answer: dict, instrument):
+    """Map a Score answer onto the instrument's scale.
+
+    The discrete answer is the most probable level -- what a respondent who must
+    pick one option would pick -- so it feeds the same scorers as every other
+    model. The probability-weighted position is kept alongside it as `expected`:
+    rounding the mean instead would turn a 50/50 split between "agree" and
+    "disagree" into a neutral answer nobody gave.
+    """
+    probabilities = {int(k): float(v) for k, v in (answer.get("probabilities") or {}).items()}
+    if not probabilities:
+        return None, None
+    level = max(probabilities, key=lambda k: (probabilities[k], -k))
+    expected = answer.get("score")
+    if expected is None:
+        expected = sum(k * p for k, p in probabilities.items())
+    return instrument.minimum + level, instrument.minimum + float(expected)
+
+
+def ask_structured(provider, model, instrument, item, max_errors=5, log=None):
+    """Ask one item of a judgement model as a Score question. Same return shape
+    as ask_isolated, plus the probability-weighted position in the attempt log.
+    """
+    state, instructions, levels = instrument.judgement(item)
+    questions = {"response": {"type": "score", "instructions": instructions, "criteria": levels}}
+    attempts = []
+    errors = 0
+    while True:
+        try:
+            data = provider.judge(model, state, questions)
+        except providers.ProviderError as exc:
+            errors += 1
+            attempts.append({"error": str(exc)[:300], "status": exc.status})
+            if not exc.retryable or errors > max_errors:
+                if log:
+                    log(f"      x {item['key']}: giving up after {errors} errors")
+                return None, "error", attempts
+            delay = exc.retry_after or min(60.0, 2.0 ** errors)
+            if log:
+                log(f"      ~ {item['key']}: {exc.status}, retrying in {delay:.0f}s")
+            time.sleep(delay)
+            continue
+
+        answer = (data.get("answers") or {}).get("response") or {}
+        value, expected = read_judgement(answer, instrument)
+        attempts.append({
+            "model": data.get("model"),
+            "parsed": value,
+            "expected": expected,
+            "probabilities": answer.get("probabilities"),
+            # Keyed by scale value rather than level index, ready for scoring.
+            "distribution": {instrument.minimum + int(k): float(v)
+                             for k, v in (answer.get("probabilities") or {}).items()},
+            "confidence": answer.get("confidence"),
+            "usage": data.get("usage"),
+        })
+        if value is None:
+            # A 200 without a distribution is a broken response, not a refusal.
+            return None, "error", attempts
+        return value, "answered", attempts
+
+
 def ask_batch(provider, model, instrument, rng, max_attempts=3, log=None):
     """Ask every item in one shuffled prompt."""
     system = build_system(instrument)
@@ -206,7 +268,12 @@ def ask_batch(provider, model, instrument, rng, max_attempts=3, log=None):
 def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None):
     """One complete pass over the instrument."""
     rng = random.Random(seed)
-    answers, refused, errored, trace = {}, [], [], {}
+    answers, refused, errored, trace, expected, distributions = {}, [], [], {}, {}, {}
+    structured = getattr(provider, "structured", False)
+    if structured and mode == "batch":
+        raise ValueError("batch mode needs a shared context window; "
+                         "judgement models are asked in isolated mode only")
+    asker = ask_structured if structured else ask_isolated
 
     if mode == "batch":
         answers, attempts, order, failed = ask_batch(provider, model, instrument, rng, log=log)
@@ -221,7 +288,7 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None):
         done = [0]
 
         def ask(item):
-            answer, status, attempts = ask_isolated(provider, model, instrument, item, log=log)
+            answer, status, attempts = asker(provider, model, instrument, item, log=log)
             with lock:
                 done[0] += 1
                 if log and done[0] % 10 == 0:
@@ -240,10 +307,17 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None):
             trace[key] = attempts
             if status == "answered":
                 answers[key] = answer
+                if structured:
+                    expected[key] = attempts[-1]["expected"]
+                    distributions[key] = attempts[-1]["distribution"]
             elif status == "refused":
                 refused.append(key)
             else:
                 errored.append(key)
 
-    return {"answers": answers, "refused": refused, "errored": errored,
-            "trace": trace, "mode": mode, "seed": seed}
+    outcome = {"answers": answers, "refused": refused, "errored": errored,
+               "trace": trace, "mode": mode, "seed": seed}
+    if structured:
+        outcome["expected"] = expected
+        outcome["distributions"] = distributions
+    return outcome

@@ -64,7 +64,11 @@ def score_measured_weights(instrument, answers: dict, omitted: list | None = Non
     table = compass.load(path if path.is_absolute() else ROOT / path)
     # The compass weight table is indexed by raw radio value (0-based), while
     # instruments express answers on their own 1-based scale.
-    shifted = {k: v - instrument.minimum for k, v in answers.items()}
+    shifted = {
+        k: ({o - instrument.minimum: pr for o, pr in v.items()} if isinstance(v, dict)
+            else v - instrument.minimum)
+        for k, v in answers.items()
+    }
     result = compass.score_offline(table, shifted, omitted)
     return {"point": result["point"], "bounds": result["bounds"],
             "omitted": result["omitted"], "sum": result["sum"]}
@@ -80,6 +84,21 @@ def score(instrument, answers: dict, omitted: list | None = None) -> dict:
         raise ValueError(f"unknown scoring type {kind!r}")
     result["n_questions"] = len(instrument.items)
     return result
+
+
+def score_expected(instrument, distributions: dict, omitted: list | None = None) -> dict:
+    """Score from per-item {value: probability} distributions instead of picks.
+
+    Judgement models report how their belief spreads across the scale. Picking
+    the top level throws that away and lets near-ties flip between runs; this
+    keeps it. Trait means take each item's expected value (reverse-keying is
+    linear, so it commutes with the expectation); the compass takes each item's
+    expected weight.
+    """
+    if instrument.scoring["type"] == "trait_mean":
+        means = {k: sum(v * p for v, p in d.items()) for k, d in distributions.items()}
+        return score(instrument, means, omitted)
+    return score(instrument, distributions, omitted)
 
 
 def type_code(instrument, point: dict) -> str:

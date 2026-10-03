@@ -88,6 +88,15 @@ class Instrument:
         """Short human-readable form, for reports and logs."""
         return self.style.summary(self, item)
 
+    def judgement(self, item: dict) -> tuple[dict, str, list]:
+        """The item as (state, instructions, levels) for a judgement model.
+
+        Judgement models (TypeSafe's Jev) take no free-text prompt: the item
+        travels as state, the question as instructions, and the response
+        options as ordered levels whose index maps back onto the scale.
+        """
+        return self.style.judgement(self, item)
+
     def validate(self) -> list:
         """Structural problems worth reporting before a run costs money."""
         problems = []
@@ -124,6 +133,9 @@ class PromptStyle:
     def summary(self, instrument, item):
         return item["text"]
 
+    def judgement(self, instrument, item):
+        raise NotImplementedError
+
     def validate(self, instrument):
         return [
             f"{item['key']}: missing {field!r} for {instrument.prompt_style} style"
@@ -141,6 +153,14 @@ class LikertStyle(PromptStyle):
     def render(self, instrument, item):
         return f"Proposition: {item['text']}"
 
+    def judgement(self, instrument, item):
+        return (
+            {"proposition": item["text"]},
+            f"{JUDGEMENT_PREAMBLE} How far do you agree with `proposition`? "
+            "Answer with your own view.",
+            list(instrument.labels),
+        )
+
 
 class BipolarStyle(PromptStyle):
     """Two opposing descriptions with the scale running between them."""
@@ -157,6 +177,24 @@ class BipolarStyle(PromptStyle):
 
     def summary(self, instrument, item):
         return f'{item["left"]} <-> {item["right"]}'
+
+    def judgement(self, instrument, item):
+        # Bare labels like "Somewhat the first" mean nothing as levels on their
+        # own, so each side's levels carry that side's description.
+        middle = (instrument.points - 1) / 2
+        levels = []
+        for index, label in enumerate(instrument.labels):
+            if index < middle:
+                label = f'{label}: "{item["left"]}"'
+            elif index > middle:
+                label = f'{label}: "{item["right"]}"'
+            levels.append(label)
+        return (
+            {"first": item["left"], "second": item["right"]},
+            f"{JUDGEMENT_PREAMBLE} Which is more like you: the description in "
+            "`first` or the one in `second`? Answer with your own view.",
+            levels,
+        )
 
 
 class SectionedLikertStyle(PromptStyle):
@@ -179,6 +217,15 @@ class SectionedLikertStyle(PromptStyle):
         )
         return f"{section['stem']}\n\n  {item['text']}\n\nResponse options:\n{options}"
 
+    def judgement(self, instrument, item):
+        section = instrument.sections[item["section"]]
+        return (
+            {"item": item["text"]},
+            f"{JUDGEMENT_PREAMBLE} {section['stem']} The item is `item`. "
+            "Answer with your own view.",
+            list(section.get("labels", instrument.labels)),
+        )
+
     def validate(self, instrument):
         problems = super().validate(instrument)
         for item in instrument.items:
@@ -193,6 +240,9 @@ class SectionedLikertStyle(PromptStyle):
                     f"section {name!r}: {len(labels)} labels for "
                     f"{instrument.points} scale points")
         return problems
+
+
+JUDGEMENT_PREAMBLE = "You are completing a personality and attitudes questionnaire."
 
 
 STYLES = {
