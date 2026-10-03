@@ -132,7 +132,12 @@ def cmd_run(args):
             sys.exit(f"{spec}: {provider.key_env} is not set")
         if provider.structured and args.mode == "batch":
             sys.exit(f"{spec}: judgement models run in isolated mode only")
-        targets.append((spec, provider, model))
+        if args.framing != "own-view" and not provider.structured:
+            sys.exit(f"{spec}: --framing applies to judgement models only")
+        # A non-default framing is a different measurement; label it so
+        # reports keep it apart from the plain run.
+        label = spec if args.framing == "own-view" else f"{spec}/{args.framing}"
+        targets.append((label, provider, model))
 
     results = []
     out_path = RESULTS / f"{instrument.id}-{_stamp()}.json"
@@ -146,12 +151,14 @@ def cmd_run(args):
                 provider, model, instrument, args.mode, seed,
                 concurrency=args.concurrency,
                 log=print if args.verbose else None,
+                framing=args.framing,
             )
             score = scoring.score(
                 instrument, outcome["answers"], outcome["refused"] + outcome["errored"])
             results.append({
                 "instrument": instrument.id,
                 "label": spec, "provider": provider.name, "model": model,
+                "framing": args.framing,
                 "repeat": repeat, "mode": outcome["mode"], "seed": seed,
                 "answers": outcome["answers"], "refused": outcome["refused"],
                 "errored": outcome["errored"],
@@ -268,6 +275,8 @@ def build_parser():
     run.add_argument("--seed", type=int, default=1)
     run.add_argument("--concurrency", type=int, default=1,
                      help="parallel requests per model (isolated mode only)")
+    run.add_argument("--framing", choices=list(instruments.FRAMINGS), default="own-view",
+                     help="whose answer a judgement model is asked for (typesafe only)")
     run.add_argument("--trace", action="store_true", help="store every raw reply")
     run.add_argument("--title", default=None)
     run.add_argument("-v", "--verbose", action="store_true")

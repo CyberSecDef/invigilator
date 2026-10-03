@@ -412,6 +412,45 @@ class JudgementModels(unittest.TestCase):
         self.assertEqual(dist[0], 0.25)          # mfq's scale starts at 0
         self.assertEqual(dist[5], 0.75)
 
+    def test_default_framing_keeps_the_wording_earlier_runs_used(self):
+        ins = instrument.load("political-compass")
+        self.assertEqual(
+            ins.judgement(ins.items[0])[1],
+            "You are completing a personality and attitudes questionnaire. "
+            "How far do you agree with `proposition`? Answer with your own view.")
+
+    def test_framings_change_only_the_instructions(self):
+        for name in instrument.available():
+            ins = instrument.load(name)
+            item = ins.items[0]
+            base_state, base_text, base_levels = ins.judgement(item)
+            for framing in instrument.FRAMINGS:
+                state, text, levels = ins.judgement(item, framing)
+                self.assertEqual((state, levels), (base_state, base_levels), f"{name}/{framing}")
+                for path in state:
+                    self.assertIn(f"`{path}`", text, f"{name}/{framing}")
+        compass_ins = instrument.load("political-compass")
+        self.assertIn("progressive", compass_ins.judgement(compass_ins.items[0], "progressive")[1])
+
+    def test_unknown_framing_fails_loudly(self):
+        ins = instrument.load("sd3")
+        with self.assertRaises(ValueError):
+            ins.judgement(ins.items[0], "sarcastic")
+
+    def test_framing_reaches_the_request(self):
+        sd3 = instrument.load("sd3")
+        jev = FakeJev({2: 1.0})
+        survey.run_once(jev, "m", sd3, "isolated", seed=1, framing="typical")
+        self.assertIn("typical adult", jev.requests[0][1]["response"]["instructions"])
+
+    def test_framing_is_refused_for_chat_models(self):
+        class Chat:
+            max_concurrency = 1
+
+        with self.assertRaises(ValueError):
+            survey.run_once(Chat(), "m", instrument.load("sd3"), "isolated", seed=1,
+                            framing="typical")
+
     def test_registry_marks_typesafe_as_structured(self):
         provider, model = providers.resolve("typesafe")
         self.assertTrue(provider.structured)

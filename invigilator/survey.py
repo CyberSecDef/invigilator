@@ -170,11 +170,12 @@ def read_judgement(answer: dict, instrument):
     return instrument.minimum + level, instrument.minimum + float(expected)
 
 
-def ask_structured(provider, model, instrument, item, max_errors=5, log=None):
+def ask_structured(provider, model, instrument, item, max_errors=5, log=None,
+                   framing="own-view"):
     """Ask one item of a judgement model as a Score question. Same return shape
     as ask_isolated, plus the probability-weighted position in the attempt log.
     """
-    state, instructions, levels = instrument.judgement(item)
+    state, instructions, levels = instrument.judgement(item, framing)
     questions = {"response": {"type": "score", "instructions": instructions, "criteria": levels}}
     attempts = []
     errors = 0
@@ -265,7 +266,8 @@ def ask_batch(provider, model, instrument, rng, max_attempts=3, log=None):
     return answers, attempts, [item["key"] for item in order], last_was_error
 
 
-def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None):
+def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
+             framing="own-view"):
     """One complete pass over the instrument."""
     rng = random.Random(seed)
     answers, refused, errored, trace, expected, distributions = {}, [], [], {}, {}, {}
@@ -273,7 +275,13 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None):
     if structured and mode == "batch":
         raise ValueError("batch mode needs a shared context window; "
                          "judgement models are asked in isolated mode only")
-    asker = ask_structured if structured else ask_isolated
+    if structured:
+        def asker(*args, **kwargs):
+            return ask_structured(*args, framing=framing, **kwargs)
+    else:
+        if framing != "own-view":
+            raise ValueError("--framing applies to judgement models only")
+        asker = ask_isolated
 
     if mode == "batch":
         answers, attempts, order, failed = ask_batch(provider, model, instrument, rng, log=log)

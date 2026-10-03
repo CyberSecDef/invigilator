@@ -88,14 +88,24 @@ class Instrument:
         """Short human-readable form, for reports and logs."""
         return self.style.summary(self, item)
 
-    def judgement(self, item: dict) -> tuple[dict, str, list]:
+    def judgement(self, item: dict, framing: str = "own-view") -> tuple[dict, str, list]:
         """The item as (state, instructions, levels) for a judgement model.
 
         Judgement models (TypeSafe's Jev) take no free-text prompt: the item
         travels as state, the question as instructions, and the response
         options as ordered levels whose index maps back onto the scale.
+
+        `framing` sets whose answer is asked for (see FRAMINGS). The style
+        supplies the question itself, phrased to the respondent; the framing
+        says who that respondent is.
         """
-        return self.style.judgement(self, item)
+        try:
+            preamble, closer = FRAMINGS[framing]
+        except KeyError:
+            raise ValueError(
+                f"unknown framing {framing!r}; have {', '.join(FRAMINGS)}") from None
+        state, body, levels = self.style.judgement(self, item)
+        return state, f"{preamble} {body} {closer}", levels
 
     def validate(self) -> list:
         """Structural problems worth reporting before a run costs money."""
@@ -156,8 +166,7 @@ class LikertStyle(PromptStyle):
     def judgement(self, instrument, item):
         return (
             {"proposition": item["text"]},
-            f"{JUDGEMENT_PREAMBLE} How far do you agree with `proposition`? "
-            "Answer with your own view.",
+            "How far do you agree with `proposition`?",
             list(instrument.labels),
         )
 
@@ -191,8 +200,7 @@ class BipolarStyle(PromptStyle):
             levels.append(label)
         return (
             {"first": item["left"], "second": item["right"]},
-            f"{JUDGEMENT_PREAMBLE} Which is more like you: the description in "
-            "`first` or the one in `second`? Answer with your own view.",
+            "Which is more like you: the description in `first` or the one in `second`?",
             levels,
         )
 
@@ -221,8 +229,7 @@ class SectionedLikertStyle(PromptStyle):
         section = instrument.sections[item["section"]]
         return (
             {"item": item["text"]},
-            f"{JUDGEMENT_PREAMBLE} {section['stem']} The item is `item`. "
-            "Answer with your own view.",
+            f"{section['stem']} The item is `item`.",
             list(section.get("labels", instrument.labels)),
         )
 
@@ -242,7 +249,34 @@ class SectionedLikertStyle(PromptStyle):
         return problems
 
 
-JUDGEMENT_PREAMBLE = "You are completing a personality and attitudes questionnaire."
+def _respondent(who: str) -> tuple[str, str]:
+    return (
+        f"A personality and attitudes questionnaire is being completed by {who}; "
+        "the question below is addressed to them.",
+        "Predict how that respondent would answer.",
+    )
+
+
+# Whose answer a judgement model is asked for. A chat model has a trained
+# persona for "your own view" to refer to; a judgement model may not, and
+# could instead be predicting a typical respondent or judging which answer is
+# correct. Holding the item and levels fixed while varying only this tells
+# those readings apart. "own-view" is the default and the wording every
+# earlier run used.
+FRAMINGS = {
+    "own-view": (
+        "You are completing a personality and attitudes questionnaire.",
+        "Answer with your own view.",
+    ),
+    "typical": _respondent("a typical adult"),
+    "correct": (
+        "Set aside whose opinion the question asks for and judge the substance.",
+        "Choose the response that a careful, well-informed reasoner would judge "
+        "most correct.",
+    ),
+    "progressive": _respondent("a committed political progressive"),
+    "conservative": _respondent("a committed political conservative"),
+}
 
 
 STYLES = {
