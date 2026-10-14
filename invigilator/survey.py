@@ -12,7 +12,8 @@ Two modes, chosen because they fail differently:
 
 Refusals are recorded, never imputed, and are kept strictly separate from
 transport failures: a rate-limited request is a broken measurement, not a
-finding about the model.
+finding about the model. A reply cut off by the token limit is a third thing,
+`truncated`: the model was still working, not declining.
 """
 
 from __future__ import annotations
@@ -65,35 +66,23 @@ SYSTEM_PER_ITEM = (
 
 # Exams are a different task from questionnaires: there is a right answer, and
 # a model that reasons first should be allowed to. The answer goes on a final
-# line so working cannot be mistaken for it.
-EXAM_SYSTEM = (
-    "You are taking a standardized test. Each question has exactly one correct "
-    "answer among the lettered choices. Work through the problem as much as you "
-    "need, then finish with a final line of the form `Answer: X`, where X is the "
-    "letter of your choice."
-)
-
-EXAM_NUDGES = [
-    "",
-    "\n\nEnd your reply with a final line `Answer: X`, where X is one of {choices}.",
-    "\n\nYour previous reply did not end with a usable answer. Reply with the single "
-    "letter ({choices}) of the choice you think is correct, and nothing else.",
-]
+# line so working cannot be mistaken for it; the exam's style says how.
+EXAM_SYSTEM = "You are taking a standardized test. {brief}"
 
 # Room to reason. Questionnaire items are one-line judgements; exam items are not,
-# and a reply cut off before its answer line scores as unanswered.
-EXAM_MAX_TOKENS = 12000
+# and a reply cut off before its answer line scores as unanswered. 12k proved too
+# little for the hardest number series; Anthropic's SDK refuses non-streaming
+# requests much above 21k, so this sits just under that.
+EXAM_MAX_TOKENS = 20000
 
-# Only the word "answer" ignores case: the letter must be a capital, or "the
-# answer is a function of x" would read as choice A.
-_ANSWER_LINE = re.compile(
-    r"(?i:\banswer)\s*(?:(?i:is)|:)?\s*[:\-]?\s*\**\s*\(?([A-J])\)?(?![A-Za-z])")
-_BARE_LETTER = re.compile(r"^\W*\(?([A-J])\)?\W*$", re.I)
+# Stop reasons meaning "ran out of tokens", across providers. A reply cut off
+# there is not a refusal, and re-asking with the same budget would only repeat it.
+TRUNCATED = {"max_tokens", "length", "MAX_TOKENS"}
 
 
 def build_system(instrument) -> str:
     if instrument.is_exam:
-        return EXAM_SYSTEM
+        return EXAM_SYSTEM.format(brief=instrument.style.brief)
     if instrument.style.describes_own_scale:
         return SYSTEM_PER_ITEM.format(points=instrument.points)
     neutrality = "" if instrument.points % 2 else "There is no neutral option and no abstention. "
@@ -126,40 +115,14 @@ def parse_answer(text: str, instrument):
     return None
 
 
-def parse_choice(text: str, item: dict):
-    """Map an exam reply onto the source letter it chose, or None.
-
-    The last `Answer: X` wins -- models sometimes restate a rejected option
-    while working -- and a reply that is nothing but a letter counts too. The
-    letter is the one displayed, so it is mapped back through the item's
-    presentation order before scoring.
-    """
-    if not text:
-        return None
-    from .instrument import MultipleChoiceStyle
-    shown = {display: source for display, source, _ in MultipleChoiceStyle.shown(item)}
-    found = _ANSWER_LINE.findall(text)
-    if found:
-        letter = found[-1].upper()
-    else:
-        bare = _BARE_LETTER.match(text.strip())
-        if not bare:
-            return None
-        letter = bare.group(1).upper()
-    return shown.get(letter)
-
-
 def looks_like_refusal(text: str) -> bool:
     return bool(text) and bool(_REFUSAL_HINT.search(text))
 
 
 def _prompt_for(instrument, item, nudge: int) -> str:
     if instrument.is_exam:
-        from .instrument import MultipleChoiceStyle
-        choices = ", ".join(shown for shown, _, _ in MultipleChoiceStyle.shown(item))
-        nudges = EXAM_NUDGES
-        return (instrument.render_item(item)
-                + nudges[min(nudge, len(nudges) - 1)].format(choices=choices))
+        nudges = instrument.style.nudges(item)
+        return instrument.render_item(item) + nudges[min(nudge, len(nudges) - 1)]
     choices = ", ".join(str(v) for v in instrument.values())
     body = (
         f"{instrument.render_item(item)}\n\n"
@@ -178,7 +141,7 @@ def ask_isolated(provider, model, instrument, item, max_nudges=3, max_errors=5, 
     system = build_system(instrument)
     if instrument.is_exam:
         budget, extra = EXAM_MAX_TOKENS, {"deliberate": True}
-        read = lambda text: parse_choice(text, item)
+        read = lambda text: instrument.style.parse(item, text)
     else:
         budget, extra = 1500, {}
         read = lambda text: parse_answer(text, instrument)
@@ -211,6 +174,10 @@ def ask_isolated(provider, model, instrument, item, max_nudges=3, max_errors=5, 
         })
         if answer is not None:
             return answer, "answered", attempts
+        if reply.stop_reason in TRUNCATED:
+            if log:
+                log(f"      ! {item['key']}: ran out of tokens before answering")
+            return None, "truncated", attempts
         if log:
             snippet = (reply.text or f"<{reply.stop_reason}>")[:70].replace("\n", " ")
             log(f"      ? {item['key']} nudge {nudge + 1}: {snippet}")
@@ -237,34 +204,16 @@ def read_judgement(answer: dict, instrument):
     return instrument.minimum + level, instrument.minimum + float(expected)
 
 
-def read_exam_judgement(answer: dict, item: dict):
-    """Map a Score answer over an exam item's choices onto source letters.
-
-    Returns (picked letter, probability on the keyed answer, {letter: p}). The
-    probability on the right answer is the exam's analogue of the expected
-    position: how much of the model's belief landed where it should.
-    """
-    from .instrument import MultipleChoiceStyle
-    sources = [source for _, source, _ in MultipleChoiceStyle.shown(item)]
-    distribution = {}
-    for k, p in (answer.get("probabilities") or {}).items():
-        index = int(k)
-        if 0 <= index < len(sources):
-            distribution[sources[index]] = float(p)
-    if not distribution:
-        return None, None, {}
-    # Ties go to the earlier displayed choice, matching read_judgement.
-    picked = max(sources, key=lambda s: distribution.get(s, 0.0))
-    return picked, distribution.get(item["answer"], 0.0), distribution
-
-
 def ask_structured(provider, model, instrument, item, max_errors=5, log=None,
                    framing="own-view"):
-    """Ask one item of a judgement model as a Score question. Same return shape
-    as ask_isolated, plus the probability-weighted position in the attempt log.
+    """Ask one item of a judgement model. Same return shape as ask_isolated,
+    plus the probability-weighted position (or, for an exam, the probability on
+    the key) in the attempt log. Questionnaire scales go as Score questions;
+    exam choices, which have no order, as Choice questions.
     """
     state, instructions, levels = instrument.judgement(item, framing)
-    questions = {"response": {"type": "score", "instructions": instructions, "criteria": levels}}
+    questions = {"response": {"type": instrument.style.judgement_type,
+                              "instructions": instructions, "criteria": levels}}
     attempts = []
     errors = 0
     while True:
@@ -285,7 +234,7 @@ def ask_structured(provider, model, instrument, item, max_errors=5, log=None,
 
         answer = (data.get("answers") or {}).get("response") or {}
         if instrument.is_exam:
-            value, expected, distribution = read_exam_judgement(answer, item)
+            value, expected, distribution = instrument.style.read_judgement(item, answer)
         else:
             value, expected = read_judgement(answer, instrument)
             # Keyed by scale value rather than level index, ready for scoring.
@@ -363,12 +312,16 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
     """One complete pass over the instrument."""
     rng = random.Random(seed)
     answers, refused, errored, trace, expected, distributions = {}, [], [], {}, {}, {}
+    truncated = []
     structured = getattr(provider, "structured", False)
     if structured and mode == "batch":
         raise ValueError("batch mode needs a shared context window; "
                          "judgement models are asked in isolated mode only")
     if instrument.is_exam and mode == "batch":
         raise ValueError("exams run in isolated mode only: each item needs room to work")
+    if structured and not instrument.style.judgeable:
+        raise ValueError(f"{instrument.id}: {instrument.prompt_style} items have no options "
+                         "for a judgement model to choose from")
     if structured:
         def asker(*args, **kwargs):
             return ask_structured(*args, framing=framing, **kwargs)
@@ -414,15 +367,17 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
                     distributions[key] = attempts[-1]["distribution"]
             elif status == "refused":
                 refused.append(key)
+            elif status == "truncated":
+                truncated.append(key)
             else:
                 errored.append(key)
 
     outcome = {"answers": answers, "refused": refused, "errored": errored,
-               "trace": trace, "mode": mode, "seed": seed}
+               "truncated": truncated, "trace": trace, "mode": mode, "seed": seed}
     if instrument.is_exam:
         # The order each item's choices were shown in, so any reply in the
         # trace can be read back against what the model actually saw.
-        outcome["orders"] = {item["key"]: item["_order"] for item in order}
+        outcome["orders"] = {item["key"]: item["_order"] for item in order if "_order" in item}
     if structured:
         outcome["expected"] = expected
         outcome["distributions"] = distributions

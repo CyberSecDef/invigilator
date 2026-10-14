@@ -38,14 +38,15 @@ def _need(path: Path, hint: str) -> dict:
 
 def cmd_fetch(args):
     """Build instrument files from their publishers. They are not vendored here."""
-    names = args.instruments or sorted(fetchers.FETCHERS)
+    names = args.instruments or sorted(
+        n for n in fetchers.FETCHERS if args.source or n not in fetchers.NEEDS_SOURCE)
     failed = []
     for name in names:
         need = fetchers.NEEDS_CONVERTER.get(name)
         suffix = f"  (needs {need})" if need else ""
         print(f"fetching {name}...{suffix}")
         try:
-            path = fetchers.build(name)
+            path = fetchers.build(name, args.source)
         except fetchers.FetchError as exc:
             failed.append((name, str(exc)))
             print(f"  FAILED: {exc}", file=sys.stderr)
@@ -136,6 +137,9 @@ def cmd_run(args):
             sys.exit(f"{spec}: --framing applies to judgement models only")
         if instrument.is_exam and args.mode == "batch":
             sys.exit(f"{instrument.id}: exams run in isolated mode only")
+        if provider.structured and not instrument.style.judgeable:
+            sys.exit(f"{spec}: {instrument.id} is answered by writing numbers in, and "
+                     "judgement models can only choose among given options")
         if instrument.is_exam and args.framing != "own-view":
             sys.exit(f"{instrument.id}: exams have no --framing; the question is what is correct")
         # A non-default framing is a different measurement; label it so
@@ -158,7 +162,7 @@ def cmd_run(args):
                 framing=args.framing,
             )
             score = scoring.score(
-                instrument, outcome["answers"], outcome["refused"] + outcome["errored"])
+                instrument, outcome["answers"], outcome["refused"] + outcome["errored"] + outcome.get("truncated", []))
             results.append({
                 "instrument": instrument.id,
                 "label": spec, "provider": provider.name, "model": model,
@@ -166,6 +170,7 @@ def cmd_run(args):
                 "repeat": repeat, "mode": outcome["mode"], "seed": seed,
                 "answers": outcome["answers"], "refused": outcome["refused"],
                 "errored": outcome["errored"],
+                "truncated": outcome.get("truncated", []),
                 "score": score,
                 "trace": outcome["trace"] if args.trace else None,
             })
@@ -178,13 +183,15 @@ def cmd_run(args):
                 results[-1]["distributions"] = outcome["distributions"]
                 results[-1]["score_expected"] = scoring.score_expected(
                     instrument, outcome["distributions"],
-                    outcome["refused"] + outcome["errored"])
+                    outcome["refused"] + outcome["errored"] + outcome.get("truncated", []))
             point = score["point"]
             flags = []
             if outcome["refused"]:
                 flags.append(f"{len(outcome['refused'])} refused")
             if outcome["errored"]:
                 flags.append(f"{len(outcome['errored'])} ERRORED")
+            if outcome.get("truncated"):
+                flags.append(f"{len(outcome['truncated'])} ran out of tokens")
             note = f"  ({', '.join(flags)})" if flags else ""
             summary = ", ".join(
                 f"{instrument.traits[t]['label']} {report.fmt(instrument, v)}"
@@ -205,8 +212,12 @@ def cmd_run(args):
     _warn_unusable(results)
     rows = report.aggregate(results, instrument)
     print("\n" + report.render_table(rows, instrument))
+    comparison = report.item_comparison(results, instrument)
+    if comparison:
+        # The summary only; the item-by-item table goes to the markdown file.
+        print("\nAgainst human results:\n" + comparison.split("\n\n")[0])
     title = args.title or f"{instrument.name} — {args.mode} mode, {args.repeats} runs each"
-    svg, md = report.write(rows, instrument, out_path.with_suffix(""), title)
+    svg, md = report.write(rows, instrument, out_path.with_suffix(""), title, results)
     print(f"\nchart -> {svg}\ntable -> {md}")
 
 
@@ -218,7 +229,8 @@ def _warn_unusable(results):
         print(
             f"  ! dropped {run['label']} repeat {run['repeat'] + 1}: only "
             f"{len(run['answers'])}/{total} answered "
-            f"({len(run.get('errored', []))} errored, {len(run['refused'])} refused)",
+            f"({len(run.get('errored', []))} errored, {len(run['refused'])} refused, "
+            f"{len(run.get('truncated', []))} out of tokens)",
             file=sys.stderr,
         )
 
@@ -245,7 +257,7 @@ def cmd_report(args):
     print(report.render_table(rows, instrument))
     stem = Path(args.out) if args.out else paths[-1].with_suffix("")
     title = args.title or instrument.name
-    svg, md = report.write(rows, instrument, stem, title)
+    svg, md = report.write(rows, instrument, stem, title, results)
     print(f"\nchart -> {svg}\ntable -> {md}")
 
 
@@ -259,6 +271,8 @@ def build_parser():
         "fetch", help="build instrument files from their publishers (not vendored here)")
     fetch.add_argument("instruments", nargs="*", metavar="NAME",
                        help="instrument ids to build; default is all of them")
+    fetch.add_argument("--source", default=None,
+                       help="local file for instruments not available by URL (icar)")
     fetch.set_defaults(func=cmd_fetch)
 
     cal = sub.add_parser("calibrate", help="measure the scoring weights, then verify them")

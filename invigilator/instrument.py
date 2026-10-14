@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +45,10 @@ class Instrument:
     @property
     def is_exam(self) -> bool:
         return self.framing == "exam"
+
+    def correct(self, item: dict, answer) -> bool:
+        """Whether an exam answer matches the item's key."""
+        return self.style.correct(item, answer)
 
     # -- scale helpers ----------------------------------------------------
     @property
@@ -137,6 +142,8 @@ class Instrument:
             problems.append(str(exc))
         else:
             problems.extend(self.style.validate(self))
+            if self.is_exam and not isinstance(self.style, ExamStyle):
+                problems.append(f"exam framing needs an exam style, not {self.prompt_style!r}")
         if self.scoring["type"] in ("trait_mean", "answer_key"):
             for item in self.items:
                 # A null trait marks an unscored item -- attention checks are asked
@@ -153,6 +160,10 @@ class PromptStyle:
 
     required = ("text",)
     describes_own_scale = False   # True when render() emits the response options itself
+    # The TypeSafe question type a judgement model is asked with. Score suits
+    # ordered response scales; unordered options need Choice.
+    judgement_type = "score"
+    judgeable = True              # False when a judgement model cannot answer it
 
     def render(self, instrument, item):
         raise NotImplementedError
@@ -269,23 +280,71 @@ class SectionedLikertStyle(PromptStyle):
         return problems
 
 
-class MultipleChoiceStyle(PromptStyle):
+# Only the word "answer" ignores case: a letter must be a capital, or "the answer
+# is a function of x" would read as choice A.
+_ANSWER_LETTER = re.compile(
+    r"(?i:\banswer)\s*(?:(?i:is)|:)?\s*[:\-]?\s*\**\s*\(?([A-J])\)?(?![A-Za-z])")
+_BARE_LETTER = re.compile(r"^\W*\(?([A-J])\)?\W*$", re.I)
+_ANSWER_TAIL = re.compile(r"(?i:\banswer)\s*(?:(?i:is)|:)?\s*[:\-]?([^\n]*)")
+# Thousands separators only in strict groups of three, so "1010,3030" reads as two
+# numbers and "1,010" as one.
+_NUMBER = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])|-?\d+(?:\.\d+)?(?:/\d+)?")
+
+
+class ExamStyle(PromptStyle):
+    """An item with a keyed answer, asked of a model that may work first.
+
+    Subclasses own everything that depends on the answer format: what the
+    model is told about it, how a reply is read, and what counts as correct.
+    """
+
+    describes_own_scale = True
+    brief = ""                    # the answer-format sentence for the system prompt
+
+    def nudges(self, item) -> list:
+        """Re-asks for a reply without a usable answer, firmest last."""
+        raise NotImplementedError
+
+    def parse(self, item, text):
+        """The answer a reply gave, in the form scored, or None."""
+        raise NotImplementedError
+
+    def correct(self, item, answer) -> bool:
+        return answer == item["answer"]
+
+    def read_judgement(self, item, answer: dict):
+        """(pick, probability on the key, distribution) from a judgement answer."""
+        raise NotImplementedError
+
+    def summary(self, instrument, item):
+        return item["stem"]
+
+
+class MultipleChoiceStyle(ExamStyle):
     """A question with one keyed answer among lettered choices.
 
     Each item carries `choices` ({letter: text}) and `answer` (a letter), plus an
     optional `passage`. `present()` reorders the choices per seed so that a
     model leaning towards one letter shows up as noise across repeats rather
     than as a fixed bias; the displayed letters are always A, B, C... and
-    `_order` maps each back to the source letter that gets scored.
+    `_order` maps each back to the source letter that gets scored. Choices
+    listed in `anchored` are not shuffled; they stay last, in their given order.
     """
 
     required = ("stem", "choices", "answer")
-    describes_own_scale = True
+    judgement_type = "choice"
+    brief = ("Each question has exactly one correct answer among the lettered "
+             "choices. Work through the problem as much as you need, then finish "
+             "with a final line of the form `Answer: X`, where X is the letter of "
+             "your choice.")
 
     def present(self, instrument, item, seed):
-        order = list(item["choices"])
+        # `anchored` choices ("None of these", "I don't know") keep their place
+        # at the end, where the people whose pass rates we compare saw them.
+        anchored = item.get("anchored", [])
+        order = [c for c in item["choices"] if c not in anchored]
         random.Random(f"{seed}:{item['key']}").shuffle(order)
-        return dict(item, _order=order)
+        return dict(item, _order=order + list(anchored))
 
     @staticmethod
     def shown(item):
@@ -302,8 +361,29 @@ class MultipleChoiceStyle(PromptStyle):
         parts.extend(f"  {shown}) {text}" for shown, _, text in self.shown(item))
         return "\n".join(parts)
 
-    def summary(self, instrument, item):
-        return item["stem"]
+    def nudges(self, item):
+        letters = ", ".join(shown for shown, _, _ in self.shown(item))
+        return [
+            "",
+            f"\n\nEnd your reply with a final line `Answer: X`, where X is one of {letters}.",
+            "\n\nYour previous reply did not end with a usable answer. Reply with the "
+            f"single letter ({letters}) of the choice you think is correct, and nothing else.",
+        ]
+
+    def parse(self, item, text):
+        """The source letter a reply chose. The last `Answer: X` wins -- models
+        restate rejected options while working -- and a bare letter counts."""
+        if not text:
+            return None
+        found = _ANSWER_LETTER.findall(text)
+        if found:
+            letter = found[-1].upper()
+        else:
+            bare = _BARE_LETTER.match(text.strip())
+            if not bare:
+                return None
+            letter = bare.group(1).upper()
+        return {display: source for display, source, _ in self.shown(item)}.get(letter)
 
     def judgement(self, instrument, item):
         state = {"question": item["stem"]}
@@ -311,8 +391,20 @@ class MultipleChoiceStyle(PromptStyle):
         if item.get("passage"):
             state["passage"] = item["passage"]
             instructions = "Using `passage`, which choice correctly answers `question`?"
-        levels = [f"{shown}) {text}" for shown, _, text in self.shown(item)]
-        return state, instructions, levels
+        # Choice criteria map option names to descriptions; the displayed
+        # letter is the name, so the reply maps back like a chat model's.
+        return state, instructions, {shown: text for shown, _, text in self.shown(item)}
+
+    def read_judgement(self, item, answer):
+        source = {display: src for display, src, _ in self.shown(item)}
+        distribution = {source[k]: float(v)
+                        for k, v in (answer.get("probabilities") or {}).items() if k in source}
+        if not distribution:
+            return None, None, {}
+        # Ties go to the earlier displayed choice.
+        picked = max((src for _, src, _ in self.shown(item)),
+                     key=lambda s: distribution.get(s, 0.0))
+        return picked, distribution.get(item["answer"], 0.0), distribution
 
     def validate(self, instrument):
         problems = super().validate(instrument)
@@ -322,10 +414,84 @@ class MultipleChoiceStyle(PromptStyle):
                 problems.append(f"{item['key']}: answer {item.get('answer')!r} is not a choice")
             if not 2 <= len(choices) <= len(LETTERS):
                 problems.append(f"{item['key']}: {len(choices)} choices")
+            if not set(item.get("anchored", [])) <= set(choices):
+                problems.append(f"{item['key']}: anchored choices are not all choices")
         return problems
 
 
-LETTERS = "ABCDEFGHIJ"   # Score questions take at most ten levels
+class WriteInStyle(ExamStyle):
+    """A question answered with one or more numbers, with no choices to pick from.
+
+    `answer` is a list of numbers as strings, in order -- number series that ask
+    for the next two terms have two. Replies are compared numerically, so "0.75",
+    ".75" and "3/4" are the same answer. Judgement models only pick among given
+    options, so they cannot sit these items.
+    """
+
+    required = ("stem", "answer")
+    judgeable = False
+    brief = ("Each question has exactly one correct answer, which you write in "
+             "yourself: there are no choices. Work through the problem as much as "
+             "you need, then finish with a final line of the form `Answer: N`. When "
+             "a question asks for more than one number, give them all on that line "
+             "in order, separated by commas, as in `Answer: N, M`. Write numbers "
+             "without thousands separators.")
+
+    @staticmethod
+    def _value(text):
+        from fractions import Fraction
+        try:
+            return Fraction(text.replace(",", ""))
+        except (ValueError, ZeroDivisionError):
+            return None
+
+    def render(self, instrument, item):
+        count = len(item["answer"])
+        ask = "one number" if count == 1 else f"{count} numbers, in order"
+        return f"Question: {item['stem']}\n\n(Give {ask}.)"
+
+    def nudges(self, item):
+        form = ", ".join("N" for _ in item["answer"])
+        return [
+            "",
+            f"\n\nEnd your reply with a final line `Answer: {form}`.",
+            "\n\nYour previous reply did not end with a usable answer. Reply with "
+            f"`Answer: {form}` and nothing else.",
+        ]
+
+    def parse(self, item, text):
+        """The numbers on the last `Answer:` line (or a reply that is only
+        numbers), normalised; None unless there are exactly as many as asked."""
+        if not text:
+            return None
+        lines = _ANSWER_TAIL.findall(text)
+        candidate = lines[-1] if lines else (
+            text.strip() if re.fullmatch(r"[\s\d.,/\-]+", text.strip()) else "")
+        numbers = [self._value(n) for n in _NUMBER.findall(candidate)]
+        if len(numbers) != len(item["answer"]) or None in numbers:
+            return None
+        return [str(n) for n in numbers]
+
+    def correct(self, item, answer):
+        if not answer or len(answer) != len(item["answer"]):
+            return False
+        return all(self._value(a) == self._value(k) for a, k in zip(answer, item["answer"]))
+
+    def judgement(self, instrument, item):
+        raise ValueError("write-in items have no options for a judgement model to choose from")
+
+    def validate(self, instrument):
+        problems = super().validate(instrument)
+        for item in instrument.items:
+            answer = item.get("answer")
+            if not isinstance(answer, list) or not answer:
+                problems.append(f"{item['key']}: answer must be a non-empty list of numbers")
+            elif any(self._value(str(a)) is None for a in answer):
+                problems.append(f"{item['key']}: answer {answer!r} is not numeric")
+        return problems
+
+
+LETTERS = "ABCDEFGHIJ"
 
 
 def _respondent(who: str) -> tuple[str, str]:
@@ -372,6 +538,7 @@ STYLES = {
     "bipolar": BipolarStyle(),
     "sectioned_likert": SectionedLikertStyle(),
     "multiple_choice": MultipleChoiceStyle(),
+    "write_in": WriteInStyle(),
 }
 
 

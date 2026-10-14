@@ -29,7 +29,12 @@ def partition(results: list) -> tuple[list, list]:
     usable, unusable = [], []
     for run in results:
         total = run["score"].get("n_questions", 62)
-        (usable if len(run["answers"]) >= MIN_ANSWERED * total else unusable).append(run)
+        measured = len(run["answers"])
+        if "correct" in run["score"]:
+            # On an exam an unanswered item is scored -- as wrong -- so only
+            # transport errors leave a hole in the measurement.
+            measured += len(run["refused"]) + len(run.get("truncated", []))
+        (usable if measured >= MIN_ANSWERED * total else unusable).append(run)
     return usable, unusable
 
 
@@ -47,6 +52,7 @@ def aggregate(results: list, instrument=None) -> list:
             "mode": runs[0]["mode"], "n": len(runs),
             "refused_mean": round(statistics.fmean(len(r["refused"]) for r in runs), 1),
             "errored_mean": round(statistics.fmean(len(r.get("errored", [])) for r in runs), 1),
+            "truncated_mean": round(statistics.fmean(len(r.get("truncated", [])) for r in runs), 1),
             "n_questions": runs[0]["score"].get("n_questions", 62),
             "traits": {},
         }
@@ -224,13 +230,16 @@ def render_svg(rows, instrument, title="Results"):
 
 def render_table(rows, instrument):
     traits = list(instrument.traits)
+    # Only shown when it happened, so questionnaire tables keep their shape.
+    cut_off = any(row.get("truncated_mean") for row in rows)
     heads = [instrument.traits[t]["label"] for t in traits]
     extra = " Type |" if instrument.report["type"] == "dichotomy" else ""
     extra_sep = "---|" if extra else ""
     header = (
         "| Model | Mode | Runs |" + extra + "".join(f" {h} |" for h in heads)
-        + " Spread | Refused | Errors |\n"
-        + "|---|---|---:|" + extra_sep + "---:|" * len(traits) + "---|---:|---:|\n"
+        + " Spread | Refused | Errors |" + (" Out of tokens |" if cut_off else "") + "\n"
+        + "|---|---|---:|" + extra_sep + "---:|" * len(traits) + "---|---:|---:|"
+        + ("---:|" if cut_off else "") + "\n"
     )
     lines = []
     for row in rows:
@@ -247,13 +256,88 @@ def render_table(rows, instrument):
         lines.append(
             f"| {row['label']} | {row['mode']} | {row['n']} |" + type_cell + "".join(cells)
             + f" {spread} | {refused} | {row.get('errored_mean', 0):g} |"
+            + (f" {row.get('truncated_mean', 0):g} |" if cut_off else "")
         )
     return header + "\n".join(lines)
 
 
-def write(rows, instrument, stem: Path, title: str):
+def item_comparison(results: list, instrument) -> str | None:
+    """Each model's per-item record set against how people did on the same items.
+
+    Only for instruments whose items carry `human` data: either a pass rate `p`
+    (the share of people who got it right) or a Rasch difficulty `beta` (higher
+    is harder). A total score says how many items a model solved; this says
+    which ones -- whether its misses fall where people's do, or somewhere
+    people find easy. A Rasch difficulty ranks items but is not a pass rate,
+    so it is never converted into one.
+    """
+    if not instrument.report.get("human_baseline"):
+        return None
+    items = [i for i in instrument.items if i.get("human")]
+    runs: dict[str, list] = {}
+    for run in partition(results)[0]:
+        runs.setdefault(run["label"], []).append(run)
+    if not items or not runs:
+        return None
+
+    by_rate = all("p" in i["human"] for i in items)
+    if by_rate:
+        hardness = lambda i: -i["human"]["p"]
+        is_hard = lambda i: i["human"]["p"] < 0.5
+        human_cell = lambda i: f"{100 * i['human']['p']:.0f}%"
+        heads = ("Humans, same items", "Solved, hard for humans (p < .5)",
+                 "Missed, easy for humans (p ≥ .5)", "r with human p", "Humans")
+        reference = lambda i: i["human"]["p"]
+    else:
+        hardness = lambda i: i["human"]["beta"]
+        is_hard = lambda i: i["human"]["beta"] > 0
+        human_cell = lambda i: f"{i['human']['beta']:+.2f}"
+        heads = (None, "Solved, harder items (β > 0)", "Missed, easier items (β ≤ 0)",
+                 "r with difficulty β", "Rasch β")
+        reference = lambda i: i["human"]["beta"]
+
+    def solved(label, item):
+        return sum(instrument.correct(item, r["answers"].get(item["key"]))
+                   for r in runs[label])
+
+    columns = ["Model", "Overall"] + [h for h in heads[:4] if h]
+    lines = ["| " + " | ".join(columns) + " |", "|---|" + "---:|" * (len(columns) - 1)]
+    hard = [i for i in items if is_hard(i)]
+    easy = [i for i in items if not is_hard(i)]
+    for label in runs:
+        n = len(runs[label])
+        rate = {i["key"]: solved(label, i) / n for i in items}
+        try:
+            r = f"{statistics.correlation([reference(i) for i in items], [rate[i['key']] for i in items]):+.2f}"
+        except statistics.StatisticsError:   # a model that never misses has no variance
+            r = "—"
+        cells = [label, f"{100 * statistics.fmean(rate.values()):.1f}%"]
+        if heads[0]:
+            cells.append(f"{100 * statistics.fmean(i['human']['p'] for i in items):.1f}%")
+        # Averaged over repeats, so these can be fractional.
+        cells += [f"{sum(rate[i['key']] for i in hard):.1f}/{len(hard)}",
+                  f"{sum(1 - rate[i['key']] for i in easy):.1f}/{len(easy)}", r]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    labels = list(runs)
+    lines += ["", "Items hardest-for-humans first. Model cells count the repeats "
+              "that answered correctly.", "",
+              f"| Item | Section | {heads[4]} | " + " | ".join(labels) + " |",
+              "|---|---|---:|" + "---:|" * len(labels)]
+    for item in sorted(items, key=lambda i: (-hardness(i), i["key"])):
+        cells = " | ".join(f"{solved(l, item)}/{len(runs[l])}" for l in labels)
+        section = instrument.traits[item["trait"]]["label"]
+        lines.append(f"| {item['key']} | {section} | {human_cell(item)} | {cells} |")
+    return "\n".join(lines)
+
+
+def write(rows, instrument, stem: Path, title: str, results: list | None = None):
     stem.parent.mkdir(parents=True, exist_ok=True)
     svg_path, md_path = stem.with_suffix(".svg"), stem.with_suffix(".md")
     svg_path.write_text(render_svg(rows, instrument, title), encoding="utf-8")
-    md_path.write_text(f"# {title}\n\n{render_table(rows, instrument)}\n", encoding="utf-8")
+    body = f"# {title}\n\n{render_table(rows, instrument)}\n"
+    comparison = item_comparison(results or [], instrument)
+    if comparison:
+        body += f"\n## Against human results\n\n{comparison}\n"
+    md_path.write_text(body, encoding="utf-8")
     return svg_path, md_path

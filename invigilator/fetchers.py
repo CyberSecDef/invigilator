@@ -635,6 +635,268 @@ def fetch_sat() -> dict:
     }
 
 
+# ICAR is distributed to registered researchers only (via PsychArchives), so it
+# cannot be fetched from a URL. The fetcher reads the archive you downloaded,
+# straight from the zip, and like every other instrument writes a gitignored
+# file: no ICAR item text ever enters this repository.
+ICAR_ROOT = "ZPID_Einreichung/"
+ICAR_SECTIONS = [  # (section, folder, key-file, psychometric-data file, items)
+    ("verbal", "00_ICAR60_and_related_tests/ICAR60_verbal_reasoning/",
+     "scoring key.pdf", "Psychometric_data.pdf", 16),
+    ("series", "00_ICAR60_and_related_tests/ICAR60_letter_and_number_series/",
+     "scoring key.pdf", "Psychometric_data-3.pdf", 9),
+]
+ICAR_PROPOSITIONAL = "01_Further_ICAR_item_types/propositional_reasoning/"
+# How the propositional items were shown to people (see that type's report):
+# the generator's six conclusions, then these two.
+ICAR_PR_TAIL = ["None of these.", "I don't know."]
+# Dropped, never repaired: the source file's R print-out has broken quoting in
+# both members of family 6 (a stray quote mid-stimulus, and a sixth option with
+# no opening quote that reads as pasted in from item 11).
+ICAR_EXCLUDED = {
+    "PR.11": "source text has broken quoting in the stimulus and option 6",
+    "PR.12": "source text has broken quoting in option 6, which belongs to PR.11",
+}
+_ICAR_HEAD = re.compile(r"^(VR|LN)\.(\d+) \((q_\d+)\)\s*$", re.M)
+_ICAR_OPTION = re.compile(r"\((\d)\)\s*(.*?)(?=\s*\(\d\)\s|\s*\(\d\)$|$)", re.S)
+
+
+def _zip_pdf_text(archive, member: str, layout: bool = False) -> str:
+    if not _tool("pdftotext"):
+        raise FetchError("icar: install poppler-utils (pdftotext) to read the item PDFs")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "in.pdf"
+        path.write_bytes(archive.read(member))
+        flags = ["-layout"] if layout else []
+        done = subprocess.run([_tool("pdftotext"), *flags, str(path), "-"],
+                              capture_output=True, text=True, timeout=120)
+    if done.returncode:
+        raise FetchError(f"icar: pdftotext failed on {member}: {done.stderr[:200]}")
+    return done.stdout
+
+
+def _icar_human(text: str) -> dict:
+    """{q_id: (proportion correct, n)} from a psychometric-data printout."""
+    rows = re.findall(r"^\W*(q_\d+)\s+\d+\s+(\d+)\s+([\d.]+)\s", text, re.M)
+    return {qid: (float(mean), int(n)) for qid, n, mean in rows}
+
+
+def _icar_items_pdf(text: str) -> list:
+    text = text.replace("\f", "\n")   # a page break glues the next header to the last line
+    heads = list(_ICAR_HEAD.finditer(text))
+    items = []
+    for i, head in enumerate(heads):
+        body = text[head.end(): heads[i + 1].start() if i + 1 < len(heads) else len(text)]
+        body = " ".join(body.split())
+        stem, sep, rest = body.partition("(1) ")
+        if not sep:
+            raise FetchError(f"icar: no options under {head.group(0).strip()}")
+        options = _ICAR_OPTION.findall("(1) " + rest)
+        numbers = [int(n) for n, _ in options]
+        if numbers != list(range(1, len(numbers) + 1)):
+            raise FetchError(f"icar: options out of order under {head.group(0).strip()}")
+        items.append({"id": f"{head.group(1)}.{head.group(2)}", "qid": head.group(3),
+                      "stem": stem.strip(), "options": [t.strip() for _, t in options]})
+    return items
+
+
+def _icar_propositional(text: str) -> list:
+    """Parse R's print() of the propositional item list, in file order."""
+    blocks = re.split(r"^\$item_family_\d+\$family_\d+_member_\d+\s*$", text, flags=re.M)[1:]
+    items = []
+    for block in blocks:
+        def field(name):
+            match = re.search(rf"\${name}\s*\n(.*?)(?=\n\$|\Z)", block, re.S)
+            if not match:
+                raise FetchError(f"icar: propositional item without {name}")
+            # Two stimuli open with a curly quote and close with a straight one.
+            return re.findall(r'[“"]((?:[^"”\\]|\\.)*)["”]|^\[\d+\]\s+(\d+)\s*$',
+                              match.group(1), re.M)
+        stimulus = field("stimulus")[0][0]
+        options = [quoted for quoted, _ in field("options")]
+        correct = int(field("correct")[0][1])
+        items.append({"stem": stimulus, "options": options, "correct": correct})
+    return items
+
+
+def fetch_icar(source: str | None = None) -> dict:
+    import zipfile
+
+    if not source:
+        raise FetchError(
+            "icar: items are distributed to registered researchers, not over a URL. "
+            "Download the ICAR archive from PsychArchives and pass it: "
+            "`invigilate fetch icar --source path/to/ZPID_Einreichung.zip`")
+    path = Path(source).expanduser()
+    if not path.exists():
+        raise FetchError(f"icar: {path} does not exist")
+    letters = "ABCDEFGHIJ"
+    items = []
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+
+        def member(rel):
+            full = ICAR_ROOT + rel
+            if full not in names:
+                raise FetchError(f"icar: {full} is not in the archive -- wrong file?")
+            return full
+
+        for section, folder, key_file, data_file, expected in ICAR_SECTIONS:
+            parsed = _icar_items_pdf(_zip_pdf_text(archive, member(folder + "items.pdf")))
+            key = {i: int(n) for i, n in re.findall(
+                r"^\s*((?:VR|LN)\.\d+):\s*\((\d)\)",
+                _zip_pdf_text(archive, member(folder + key_file)), re.M)}
+            human = _icar_human(_zip_pdf_text(archive, member(folder + data_file), layout=True))
+            ids = [item["id"] for item in parsed]
+            if len(parsed) != expected or set(ids) != set(key):
+                raise FetchError(f"icar {section}: {len(parsed)} items parsed, key covers "
+                                 f"{sorted(set(key) ^ set(ids)) or 'the same'} -- expected {expected}")
+            for item in parsed:
+                if not 1 <= key[item["id"]] <= len(item["options"]):
+                    raise FetchError(f"icar: key for {item['id']} is not an option")
+                if item["qid"] not in human:
+                    raise FetchError(f"icar: no human data for {item['id']} ({item['qid']})")
+                p, n = human[item["qid"]]
+                items.append({
+                    "key": item["id"], "trait": section, "stem": item["stem"],
+                    "choices": dict(zip(letters, item["options"])),
+                    "answer": letters[key[item["id"]] - 1],
+                    # The last two options are "None of these" and "I don't know"
+                    # (or a variant); people saw them last, so they stay last.
+                    "anchored": list(letters[len(item["options"]) - 2: len(item["options"])]),
+                    "source_id": item["qid"], "human": {"p": p, "n": n},
+                })
+
+        raw = archive.read(member(
+            ICAR_PROPOSITIONAL + "translations/items_plain_text-eng-GB.txt")).decode("utf-8-sig")
+        propositional = _icar_propositional(raw)
+        human = _icar_human(_zip_pdf_text(
+            archive, member(ICAR_PROPOSITIONAL + "Psychometric_data.pdf"), layout=True))
+        if len(propositional) != 30 or len(human) != 30:
+            raise FetchError(f"icar propositional: {len(propositional)} items, "
+                             f"{len(human)} with human data -- expected 30 of each")
+        for number, item in enumerate(propositional, 1):
+            if f"PR.{number:02d}" in ICAR_EXCLUDED:
+                continue
+            options = item["options"] + ICAR_PR_TAIL
+            qid = f"q_{17000 + number}"
+            if qid not in human or not 1 <= item["correct"] <= 6 or len(item["options"]) != 6:
+                raise FetchError(f"icar: propositional item {number} is malformed")
+            p, n = human[qid]
+            items.append({
+                "key": f"PR.{number:02d}", "trait": "propositional",
+                "stem": ("Which conclusion follows from the statements below?\n\n"
+                         + item["stem"]),
+                "choices": dict(zip(letters, options)),
+                "answer": letters[item["correct"] - 1],
+                "anchored": ["G", "H"],
+                "source_id": qid, "human": {"p": p, "n": n},
+            })
+
+    return {
+        "id": "icar",
+        "name": "ICAR verbal, series and propositional reasoning",
+        "source": "https://icar-project.com/ (PsychArchives deposit, registered access)",
+        "citation": ("Condon, D. M., & Revelle, W. (2014). The International Cognitive "
+                     "Ability Resource: Development and initial validation of a "
+                     "public-domain measure. Intelligence, 43, 52-64. Propositional "
+                     "items: Guhne, D., Doebler, P., Condon, D. M., Luo, F., & Sun, L. "
+                     "(2020). European Journal of Psychological Assessment."),
+        "note": ("Text-only ICAR item types: 16 verbal reasoning and 9 letter-and-number "
+                 "series items from ICAR-60, and the 30 fixed propositional reasoning "
+                 "items. Items, keys and per-item human pass rates are read from the "
+                 "archive the user supplies; none of it is committed. Propositional "
+                 "items are paired with q_17001-q_17030 by file order, matching the "
+                 "type's report; PR.11 and PR.12 are dropped for broken source text "
+                 "(see `excluded`). The fixed items ship without an instruction, so "
+                 "each stem is prefixed with 'Which conclusion follows from the "
+                 "statements below?'. They carry the 'None of these' / 'I don't know' "
+                 "options people were shown. Those two options stay last when choices "
+                 "are shuffled. Human pass rates come from large self-selected online "
+                 "samples (SAPA); they place items by difficulty, they are not IQ norms."),
+        "prompt_style": "multiple_choice",
+        "framing": "exam",
+        "scale": {"min": 1, "points": 8, "labels": list(letters[:8])},
+        "traits": {
+            "overall": {"label": "Overall", "range": [0, 100]},
+            "verbal": {"label": "Verbal reasoning", "range": [0, 100]},
+            "series": {"label": "Letter & number series", "range": [0, 100]},
+            "propositional": {"label": "Propositional reasoning", "range": [0, 100]},
+        },
+        "scoring": {"type": "answer_key", "overall": "overall"},
+        "report": {"type": "bars", "unit": "%", "human_baseline": True},
+        "excluded": ICAR_EXCLUDED,
+        "items": items,
+    }
+
+
+ICAR_NUMBERS = "01_Further_ICAR_item_types/number_series/number series.csv"
+
+
+def fetch_icar_numbers(source: str | None = None) -> dict:
+    import csv
+    import io
+    import zipfile
+
+    if not source:
+        raise FetchError(
+            "icar-numbers: items are distributed to registered researchers, not over "
+            "a URL. Pass the ICAR archive: "
+            "`invigilate fetch icar-numbers --source path/to/ZPID_Einreichung.zip`")
+    path = Path(source).expanduser()
+    if not path.exists():
+        raise FetchError(f"icar-numbers: {path} does not exist")
+    with zipfile.ZipFile(path) as archive:
+        try:
+            raw = archive.read(ICAR_ROOT + ICAR_NUMBERS).decode("utf-8-sig")
+        except KeyError:
+            raise FetchError(f"icar-numbers: {ICAR_ROOT + ICAR_NUMBERS} is not in the "
+                             "archive -- wrong file?") from None
+    rows = list(csv.DictReader(io.StringIO(raw), delimiter=";"))
+    items = []
+    for row in rows:
+        row = {k.strip(): (v or "").strip() for k, v in row.items()}
+        number = int(row["Items"])
+        terms = [t for t in row["seq"].replace("…", "").split(",") if t.strip()]
+        answer = [a for a in (row["ans1"], row["ans2"]) if a]
+        if not terms or not answer or not all(t.strip().isdigit() for t in terms + answer):
+            raise FetchError(f"icar-numbers: item {number} is malformed: {row}")
+        ask = ("what number comes next?" if len(answer) == 1
+               else "what are the next two numbers?")
+        items.append({
+            "key": f"NS.{number:02d}", "trait": "numbers",
+            "stem": f"In the following number series, {ask} {', '.join(terms)}, ...",
+            "answer": answer,
+            # Rasch difficulty, decimal comma in the source; higher is harder.
+            "human": {"beta": float(row["beta (Rasch)"].replace(",", "."))},
+        })
+    if [i["key"] for i in items] != [f"NS.{n:02d}" for n in range(1, len(items) + 1)] \
+            or len(items) != 49:
+        raise FetchError(f"icar-numbers: expected items 1-49 in order, got {len(items)}")
+    return {
+        "id": "icar-numbers",
+        "name": "ICAR number series",
+        "source": "https://icar-project.com/ (PsychArchives deposit, registered access)",
+        "citation": ("Loe, B., Sun, L., Simonfy, F., & Doebler, P. (2018). Evaluating an "
+                     "Automated Number Series Item Generator Using Linear Logistic Test "
+                     "Models. Journal of Intelligence, 6(2), 20."),
+        "note": ("49 write-in number series items from the ICAR archive (its readme says "
+                 "48; the file has 49). People typed the next one or two numbers with no "
+                 "choices offered, and so do the models. The source gives each item's "
+                 "sequence, answer and Rasch difficulty; the question wording is ours, "
+                 "matching ICAR's letter-and-number series items. Rasch difficulties rank "
+                 "items for people; they are not pass rates and are not converted into "
+                 "any. Judgement models cannot sit write-in items."),
+        "prompt_style": "write_in",
+        "framing": "exam",
+        "scale": {"min": 1, "points": 1, "labels": ["number"]},
+        "traits": {"numbers": {"label": "Number series", "range": [0, 100]}},
+        "scoring": {"type": "answer_key"},
+        "report": {"type": "bars", "unit": "%", "human_baseline": True},
+        "items": items,
+    }
+
+
 FETCHERS = {
     "political-compass": fetch_political_compass,
     "big-five": fetch_big_five,
@@ -645,17 +907,24 @@ FETCHERS = {
     "dirty-dozen": fetch_dirty_dozen,
     "oejts": fetch_oejts,
     "sat": fetch_sat,
+    "icar": fetch_icar,
+    "icar-numbers": fetch_icar_numbers,
 }
+
+# Fetchers that read a file the user supplies rather than a URL. They are
+# skipped by a bare `invigilate fetch` unless --source is given.
+NEEDS_SOURCE = {"icar": "the ICAR archive from PsychArchives (ZPID_Einreichung.zip)",
+                "icar-numbers": "the ICAR archive from PsychArchives (ZPID_Einreichung.zip)"}
 
 NEEDS_CONVERTER = {"hexaco": "a .doc converter (antiword, catdoc or libreoffice)",
                    "mfq": "a .doc converter (antiword, catdoc or libreoffice)",
                    "dirty-dozen": "pdftotext (poppler-utils) or libreoffice"}
 
 
-def build(name: str) -> Path:
+def build(name: str, source: str | None = None) -> Path:
     if name not in FETCHERS:
         raise FetchError(f"unknown instrument {name!r}; have {', '.join(sorted(FETCHERS))}")
-    spec = FETCHERS[name]()
+    spec = FETCHERS[name](source) if name in NEEDS_SOURCE else FETCHERS[name]()
     from . import instrument as instrument_module
 
     problems = instrument_module.Instrument(spec).validate()

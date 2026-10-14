@@ -15,6 +15,8 @@ not code.
 | `dirty-dozen` | 12 | 5-point agreement | The same three traits, 12 items |
 | `oejts` | 32 | 5-point bipolar | Four dichotomies + a four-letter type |
 | `sat` | 410 | 4-choice, keyed | Percent correct: Math, Reading, Overall |
+| `icar` | 53 | 8-choice, keyed | Percent correct, plus per-item human pass rates |
+| `icar-numbers` | 49 | Write-in numbers | Percent correct, plus per-item Rasch difficulty |
 
 ```bash
 invigilate instruments                               # what's available
@@ -131,10 +133,11 @@ The weighted score barely moves when that happens. Two more differences: it
 cannot refuse, so its refusal count is zero by construction, and it runs in
 isolated mode only. Key: `TYPESAFE_API_KEY`.
 
-## Exams: `sat`
+## Exams: `sat`, `icar`, `icar-numbers`
 
-`sat` is the odd one out: questions with right answers, not a questionnaire.
-Items are AGIEval's `sat-math` and `sat-en` sets, pinned to a commit and
+Three instruments are tests with right answers rather than questionnaires.
+
+**`sat`** is AGIEval's `sat-math` and `sat-en` sets, pinned to a commit and
 fetched like everything else. Sixteen are dropped at build time, never edited:
 nine reading questions that need a graph or table the source does not carry,
 and seven whose text has page furniture from the original PDFs spliced in.
@@ -143,30 +146,91 @@ in `SAT_EXCLUDED` and saved in the built file. The English set is reading
 comprehension only, hence "Reading" rather than the current test's "Reading
 and Writing".
 
+**`icar`** and **`icar-numbers`** are the text-only item types of the
+International Cognitive Ability Resource. ICAR is distributed to registered
+researchers through PsychArchives, not over a URL, so these two are built from
+the archive you download (`ZPID_Einreichung.zip`). The fetcher reads it in
+place; nothing from it is committed.
+
+- `icar`: 16 verbal reasoning and 9 letter-and-number series items from
+  ICAR-60, and 28 of the 30 fixed propositional reasoning items (PR.11-12 are
+  dropped for broken quoting in the source; see `ICAR_EXCLUDED`). Eight
+  choices each, with "None of these" and "I don't know" kept last, where people
+  saw them.
+- `icar-numbers`: 49 number series where the next one or two numbers are
+  written in, with no choices. Judgement models cannot sit it.
+
+### Getting the ICAR archive
+
+ICAR's items are free for research use but deliberately kept off the open web,
+so people (and models) cannot study them in advance. This repository does not
+contain them and never will: not the items, not the answer keys, not the human
+data. Each user gets their own copy:
+
+1. Go to the ICAR site, <https://icar-project.com/>, and follow its download
+   link for the item types. The materials are deposited with PsychArchives
+   (ZPID, the Leibniz Institute for Psychology).
+2. Sign in when asked. PsychArchives' delivery service accepts an ORCID
+   account or a free Leibniz Psychology account, and you register there.
+3. Read and accept the terms of use shown with the download. The guidelines
+   inside the archive ask that ICAR be cited in any work using it; the
+   citations travel in each built instrument's `citation` field.
+4. Download the archive, `ZPID_Einreichung.zip` (about 1.1 GB; nearly all of
+   that is image, audio and generator material these instruments do not use).
+5. Build the two instruments from it. No need to unzip it first; the fetcher
+   reads the zip in place:
+
+   ```bash
+   invigilate fetch icar icar-numbers --source ~/Downloads/ZPID_Einreichung.zip
+   ```
+
+The built files land in `instruments/`, and run results in `results/`, both
+gitignored. Keep it that way: the results contain item text under `--trace`.
+The fetcher checks what it reads -- that every item has a key and human data,
+and that the counts match -- and refuses to build from an archive that does not
+match the layout described in `fetchers.py`.
+
 ```bash
 invigilate fetch sat
-invigilate run typesafe anthropic -i sat --repeats 3 --concurrency 6
+invigilate fetch icar icar-numbers --source ~/Downloads/ZPID_Einreichung.zip
+invigilate run typesafe anthropic -i icar --repeats 3 --concurrency 6
+invigilate run anthropic -i icar-numbers --repeats 3
 ```
 
 What changes for an exam:
 
 - **Framing.** The system prompt asks for the correct answer, not the
-  respondent's view, and `--framing` is refused. Jev gets the same wording.
+  respondent's view, and `--framing` is refused.
 - **Room to reason.** Chat models are asked deliberately: Anthropic drops the
   low-effort setting, Ollama turns thinking on, and the token budget rises to
-  12k. The reply must end with `Answer: X`; the last such line wins.
+  20k. The reply must end with `Answer: X` (or `Answer: N, M` for write-ins);
+  the last such line wins. Write-in answers are compared as numbers, so `0.75`
+  and `3/4` match.
+- **Choice questions for Jev.** Exam options go to Jev as TypeSafe *Choice*
+  questions, not *Score*: Score treats its levels as an ordered scale, which
+  multiple-choice options are not. Questionnaires stay on Score.
 - **Shuffled choices.** Each item's choices are reordered per seed (the same
   order for every model), so a model that favours one letter shows up as
   spread across repeats instead of a fixed bias. Each run saves the orders.
-- **Scoring.** Percent correct per section. The SAT has no guessing penalty,
-  so an unanswered item is wrong; the upper bound shows what the unanswered
-  items were worth. For Jev, `score_expected` credits each item with the
-  probability placed on the keyed answer.
+- **Scoring.** Percent correct per section. Unanswered items are wrong, as on
+  the SAT and ICAR, and the upper bound shows what they were worth. For Jev,
+  `score_expected` credits each item with the probability placed on the key.
+- **Out of tokens is not a refusal.** A reply cut off by the token limit is
+  recorded as `truncated`, reported in its own column, and not re-asked with
+  the same budget.
+- **Against people.** ICAR items carry human results, and reports add an
+  item-by-item table: pass rates (n of 27k to 119k per item) for `icar`, Rasch
+  difficulty for `icar-numbers`, which ranks items but is never turned into a
+  pass rate. Neither is an IQ norm; the samples are self-selected online
+  test-takers, and the tables say which items a model misses rather than
+  where it would rank among people.
 - **Isolated mode only.**
 
-Two caveats travel with the numbers. The items come from several different
-tests, so there is no raw-to-scaled table and no 1600-point score. And they are
-public SAT practice questions, very likely in every model's training data.
+The SAT items come from several different tests, so there is no raw-to-scaled
+table and no 1600-point score. They are also public practice questions, very
+likely in every model's training data. ICAR items are kept off the open web,
+which is the point of registering for them -- and running them through an API
+sends their text to that provider.
 
 ## The two modes, and why
 

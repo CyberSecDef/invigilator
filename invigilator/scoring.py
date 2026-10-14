@@ -102,7 +102,7 @@ def score_answer_key(instrument, answers: dict, omitted: list | None = None,
             missing[section] += 1
         elif credit is not None:
             earned[section] += credit[item["key"]]
-        elif answers[item["key"]] == item["answer"]:
+        elif instrument.correct(item, answers[item["key"]]):
             earned[section] += 1
 
     groups = {overall: sections} if overall else {}

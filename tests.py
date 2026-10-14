@@ -3,7 +3,7 @@
 import unittest
 from pathlib import Path
 
-from invigilator import compass, instrument, providers, report, scoring, survey
+from invigilator import compass, fetchers, instrument, providers, report, scoring, survey
 
 DATA = Path(__file__).parent / "data"
 
@@ -314,7 +314,15 @@ class FakeJev:
 
     def judge(self, model, state, questions):
         self.requests.append((state, questions))
-        levels = len(questions["response"]["criteria"])
+        question = questions["response"]
+        if question["type"] == "choice":
+            # Choice answers are keyed by option name; odds go by position.
+            names = list(question["criteria"])
+            probs = {name: self.probabilities.get(i, 0.0) for i, name in enumerate(names)}
+            return {"model": "jev-test", "answers": {"response": {
+                "type": "choice", "choice": max(probs, key=probs.get),
+                "probabilities": probs, "confidence": 0.5}}}
+        levels = len(question["criteria"])
         probs = {str(i): self.probabilities.get(i, 0.0) for i in range(levels)}
         return {"model": "jev-test", "answers": {"response": {
             "type": "score", "probabilities": probs, "confidence": 0.5,
@@ -325,6 +333,8 @@ class JudgementModels(unittest.TestCase):
     def test_every_builtin_renders_levels_matching_its_scale(self):
         for name in instrument.available():
             ins = instrument.load(name)
+            if not ins.style.judgeable:
+                continue
             for item in ins.items:
                 state, instructions, levels = ins.judgement(item)
                 self.assertEqual(len(levels), ins.points, f"{name}:{item['key']}")
@@ -503,7 +513,7 @@ class Exams(unittest.TestCase):
         # Whatever letter "4" is shown under, choosing it scores as the key.
         shown = next(d for d, src, _ in instrument.MultipleChoiceStyle.shown(first)
                      if src == "C")
-        self.assertEqual(survey.parse_choice(f"Answer: {shown}", first), "C")
+        self.assertEqual(self.exam.style.parse(first, f"Answer: {shown}"), "C")
 
     def test_presentation_leaves_questionnaires_alone(self):
         sd3 = instrument.load("sd3")
@@ -526,7 +536,7 @@ class Exams(unittest.TestCase):
             ("ANSWER: B", "B"),
         ]
         for text, expected in cases:
-            self.assertEqual(survey.parse_choice(text, item), expected, text)
+            self.assertEqual(self.exam.style.parse(item, text), expected, text)
 
     def test_exam_prompts_ask_for_correctness_not_opinion(self):
         system = survey.build_system(self.exam)
@@ -577,6 +587,17 @@ class Exams(unittest.TestCase):
         self.assertTrue(all(d and t >= 4000 for t, d in solver.calls))
         self.assertEqual(scoring.score(self.exam, outcome["answers"])["point"]["overall"], 100)
 
+    def test_exam_choices_go_to_jev_as_choice_questions(self):
+        jev = FakeJev({0: 1.0})
+        survey.run_once(jev, "jev", self.exam, "isolated", seed=1)
+        question = jev.requests[0][1]["response"]
+        self.assertEqual(question["type"], "choice")
+        self.assertEqual(list(question["criteria"]), ["A", "B", "C", "D"])
+        # Questionnaires keep Score: their scales are ordered.
+        sd3 = instrument.load("sd3")
+        survey.run_once(jev, "jev", sd3, "isolated", seed=1)
+        self.assertEqual(jev.requests[-1][1]["response"]["type"], "score")
+
     def test_jev_picks_map_to_source_letters_and_credit_is_probability_on_key(self):
         # Jev puts 0.6 on the first displayed level and 0.4 on the second.
         jev = FakeJev({0: 0.6, 1: 0.4})
@@ -617,6 +638,213 @@ class Exams(unittest.TestCase):
             text = " ".join([item["stem"], item.get("passage", ""), *item["choices"].values()])
             self.assertNotIn("Unauthorized copying", text, item["key"])
             self.assertNotIn("DIRECTIONS", text, item["key"])
+
+
+def tiny_write_in():
+    return instrument.Instrument({
+        "id": "tiny-write-in", "name": "Tiny write-in", "prompt_style": "write_in",
+        "framing": "exam", "scale": {"min": 1, "points": 1, "labels": ["number"]},
+        "traits": {"numbers": {"label": "Numbers", "range": [0, 100]}},
+        "scoring": {"type": "answer_key"},
+        "report": {"type": "bars", "unit": "%", "human_baseline": True},
+        "items": [
+            {"key": "n1", "trait": "numbers", "stem": "2, 4, 6, ...", "answer": ["8"],
+             "human": {"beta": -1.0}},
+            {"key": "n2", "trait": "numbers", "stem": "1, 10, 2, 20, ...", "answer": ["3", "30"],
+             "human": {"beta": 1.5}},
+            {"key": "n3", "trait": "numbers", "stem": "1/2, 1/4, ...", "answer": ["0.125"],
+             "human": {"beta": 0.5}},
+        ],
+    })
+
+
+class WriteIn(unittest.TestCase):
+    def setUp(self):
+        self.exam = tiny_write_in()
+        self.one, self.two, self.frac = self.exam.items
+
+    def test_validates_and_rejects_non_numeric_keys(self):
+        self.assertEqual(self.exam.validate(), [])
+        spec = dict(self.exam.spec, items=[dict(self.one, answer=["eight"])])
+        self.assertTrue(instrument.Instrument(spec).validate())
+
+    def test_parses_the_last_answer_line_and_compares_numerically(self):
+        parse = self.exam.style.parse
+        cases = [
+            (self.one, "Each term adds 2.\nAnswer: 8", ["8"]),
+            (self.one, "Answer: 6\nNo wait.\nAnswer: 8.0", ["8"]),
+            (self.one, "8", ["8"]),
+            (self.one, "**Answer:** 8", ["8"]),
+            (self.one, "The answer is 8.", ["8"]),
+            (self.two, "Answer: 3, 30", ["3", "30"]),
+            (self.two, "Answer: 3 and 30", ["3", "30"]),
+            (self.two, "Answer: 3", None),            # one of two asked for
+            (self.one, "Answer: 1,010", ["1010"]),     # thousands separator
+            (self.two, "Answer: 1010,3030", ["1010", "3030"]),
+            (self.frac, "Answer: 1/8", ["1/8"]),
+            (self.one, "I am not sure.", None),
+            (self.one, "", None),
+        ]
+        for item, text, expected in cases:
+            self.assertEqual(parse(item, text), expected, text)
+        self.assertTrue(self.exam.correct(self.frac, ["1/8"]))
+        self.assertTrue(self.exam.correct(self.one, ["8.0"]))
+        self.assertFalse(self.exam.correct(self.two, ["30", "3"]))   # order matters
+        self.assertFalse(self.exam.correct(self.one, None))
+
+    def test_prompt_says_how_many_numbers_and_never_offers_choices(self):
+        system = survey.build_system(self.exam)
+        self.assertIn("no choices", system)
+        self.assertNotIn("lettered", system)
+        self.assertIn("2 numbers", survey._prompt_for(self.exam, self.two, 0))
+        self.assertIn("Answer: N, N", survey._prompt_for(self.exam, self.two, 1))
+
+    def test_a_chat_model_run_scores_write_ins(self):
+        class Solver:
+            max_concurrency = 1
+            replies = {"2, 4, 6": "Answer: 8", "1, 10, 2, 20": "Answer: 3, 30",
+                       "1/2, 1/4": "Answer: 0.25"}       # wrong
+
+            def complete(self, model, system, user, max_tokens, deliberate=False):
+                return providers.Reply(text=next(v for k, v in self.replies.items() if k in user))
+
+        outcome = survey.run_once(Solver(), "m", self.exam, "isolated", seed=1)
+        self.assertEqual(outcome["orders"], {})
+        result = scoring.score(self.exam, outcome["answers"])
+        self.assertAlmostEqual(result["point"]["numbers"], 200 / 3, places=3)
+
+    def test_judgement_models_are_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            survey.run_once(FakeJev({0: 1.0}), "jev", self.exam, "isolated", seed=1)
+        self.assertIn("judgement model", str(ctx.exception))
+
+    def test_item_comparison_ranks_by_rasch_difficulty_without_inventing_pass_rates(self):
+        answers = {"n1": ["8"], "n2": ["3", "30"], "n3": ["0.5"]}
+        runs = [{"label": "m", "provider": "p", "model": "m", "mode": "isolated",
+                 "answers": answers, "refused": [], "errored": [],
+                 "score": scoring.score(self.exam, answers)}]
+        text = report.item_comparison(runs, self.exam)
+        self.assertIn("Rasch β", text)
+        self.assertNotIn("Humans, same items", text)
+        self.assertLess(text.index("| n2 |"), text.index("| n3 |"))   # hardest first
+        self.assertLess(text.index("| n3 |"), text.index("| n1 |"))
+        self.assertIn("| 1.0/2 | 0.0/1 |", text)    # solved 1 of 2 harder, missed 0 of 1 easier
+
+
+class Truncation(unittest.TestCase):
+    def test_running_out_of_tokens_is_truncated_not_refused_and_is_not_re_asked(self):
+        class Overthinks:
+            max_concurrency = 1
+            calls = 0
+
+            def complete(self, *a, **k):
+                Overthinks.calls += 1
+                return providers.Reply(text="", stop_reason="max_tokens")
+
+        exam = tiny_exam()
+        answer, status, attempts = survey.ask_isolated(Overthinks(), "m", exam, exam.items[0])
+        self.assertEqual((answer, status, Overthinks.calls), (None, "truncated", 1))
+        outcome = survey.run_once(Overthinks(), "m", exam, "isolated", seed=1)
+        self.assertEqual(sorted(outcome["truncated"]), ["m1", "m2", "r1"])
+        self.assertEqual(outcome["refused"], [])
+
+    def test_unanswered_exam_items_count_as_wrong_not_as_a_broken_run(self):
+        exam = tiny_exam()
+        answers = {"m1": "C"}
+        run = {"label": "m", "provider": "p", "model": "m", "mode": "isolated",
+               "answers": answers, "refused": ["m2"], "truncated": ["r1"], "errored": [],
+               "score": scoring.score(exam, answers, ["m2", "r1"])}
+        usable, dropped = report.partition([run])
+        self.assertEqual((len(usable), len(dropped)), (1, 0))
+        self.assertIn("| 1 |", report.render_table(report.aggregate(usable, exam), exam))
+        broken = dict(run, refused=[], truncated=[], errored=["m2", "r1"])
+        self.assertEqual(len(report.partition([broken])[1]), 1)
+
+    def test_exam_budget_leaves_room_for_hard_items(self):
+        self.assertGreaterEqual(survey.EXAM_MAX_TOKENS, 20000)
+
+
+class Icar(unittest.TestCase):
+    """Parsers for the ICAR archive, against text shaped like the real files."""
+
+    def test_items_pdf_survives_page_breaks_and_wrapped_options(self):
+        text = ("VR.04 (q_99004)\nWhat is 2+2?\n(1) 3 (2) 4 (3) 5 (4) 6 (5) 7 (6) 8 (7)\n"
+                "None of these (8) I don't know\n\n\x0cVR.09 (q_99009)\nOdd one out:\n"
+                "(1) Elm (2) Oak (3) Rose (4) Ash (5) Fir (6) Yew (7) They all match "
+                "(8) I don't know\n")
+        items = fetchers._icar_items_pdf(text)
+        self.assertEqual([i["id"] for i in items], ["VR.04", "VR.09"])
+        self.assertEqual(items[0]["options"][6], "None of these")
+        self.assertEqual(len(items[1]["options"]), 8)
+
+    def test_propositional_parser_reads_r_print_output_with_curly_quotes(self):
+        text = ('$item_family_1\r\n$item_family_1$family_1_member_1\r\n'
+                '$item_family_1$family_1_member_1$stimulus\r\n'
+                '[1] \u201cA or B. When A, C."\r\n\r\n'
+                '$item_family_1$family_1_member_1$options\r\n'
+                '[1] "C."        "Not C."\r\n[3] "A."   "B."\r\n[5] "A and C."  "When not B, C."\r\n\r\n'
+                '$item_family_1$family_1_member_1$correct\r\n[1] 6\r\n')
+        [item] = fetchers._icar_propositional(text)
+        self.assertEqual(item["stem"], "A or B. When A, C.")
+        self.assertEqual(item["options"], ["C.", "Not C.", "A.", "B.", "A and C.", "When not B, C."])
+        self.assertEqual(item["correct"], 6)
+
+    def test_human_data_rows_parse_from_layout_text(self):
+        # Invented values in the printout's layout; real ICAR data stays out of the repo.
+        text = ("## vars n mean sd min max range se\n"
+                "## q_99001    4 12345 0.25 0.43   0   1     1 0\n"
+                "## q_99002   11 23456 0.75 0.43   0   1     1 0\n")
+        self.assertEqual(fetchers._icar_human(text),
+                         {"q_99001": (0.25, 12345), "q_99002": (0.75, 23456)})
+
+    def test_fetch_without_a_source_explains_where_to_get_it(self):
+        with self.assertRaises(fetchers.FetchError) as ctx:
+            fetchers.fetch_icar(None)
+        self.assertIn("--source", str(ctx.exception))
+
+    def test_anchored_choices_stay_last_whatever_the_seed(self):
+        exam = tiny_exam()
+        item = dict(exam.items[0], anchored=["D"])
+        for seed in range(20):
+            self.assertEqual(exam.present(item, seed)["_order"][-1], "D")
+        self.assertEqual(len({tuple(exam.present(item, s)["_order"]) for s in range(20)}) > 1, True)
+
+    def test_item_comparison_sets_misses_against_human_pass_rates(self):
+        spec = dict(tiny_exam().spec)
+        spec["report"] = dict(spec["report"], human_baseline=True)
+        spec["items"] = [dict(i, human={"p": p, "n": 100})
+                         for i, p in zip(spec["items"], [0.9, 0.2, 0.6])]
+        exam = instrument.Instrument(spec)
+        # Solves the item humans find hard, misses one they find easy.
+        answers = {"m1": "A", "m2": "A", "r1": "B"}
+        runs = [{"label": "m", "provider": "p", "model": "m", "mode": "isolated",
+                 "answers": answers, "refused": [], "errored": [],
+                 "score": scoring.score(exam, answers)}]
+        text = report.item_comparison(runs, exam)
+        self.assertIn("| 1.0/1 | 1.0/2 |", text)      # solved hard 1/1, missed easy 1/2
+        self.assertLess(text.index("| m2 |"), text.index("| r1 |"))   # hardest first
+        self.assertIsNone(report.item_comparison(runs, tiny_exam()))
+
+    def test_built_icar_matches_its_source_if_fetched(self):
+        if "icar" not in instrument.available():
+            self.skipTest("run `invigilate fetch icar --source ...`")
+        icar = instrument.load("icar")
+        counts = {}
+        for item in icar.items:
+            counts[item["trait"]] = counts.get(item["trait"], 0) + 1
+            self.assertIn("p", item["human"])
+            self.assertEqual(len(item["choices"]), 8, item["key"])
+        self.assertEqual(counts, {"verbal": 16, "series": 9, "propositional": 28})
+        self.assertEqual(icar.validate(), [])
+        self.assertFalse(set(icar.keys()) & set(icar.spec["excluded"]))
+
+    def test_built_icar_numbers_match_their_source_if_fetched(self):
+        if "icar-numbers" not in instrument.available():
+            self.skipTest("run `invigilate fetch icar-numbers --source ...`")
+        numbers = instrument.load("icar-numbers")
+        self.assertEqual(len(numbers.items), 49)
+        self.assertEqual(sum(len(i["answer"]) == 2 for i in numbers.items), 26)
+        self.assertEqual(numbers.validate(), [])
 
 
 if __name__ == "__main__":
