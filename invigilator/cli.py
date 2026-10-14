@@ -134,6 +134,10 @@ def cmd_run(args):
             sys.exit(f"{spec}: judgement models run in isolated mode only")
         if args.framing != "own-view" and not provider.structured:
             sys.exit(f"{spec}: --framing applies to judgement models only")
+        if instrument.is_exam and args.mode == "batch":
+            sys.exit(f"{instrument.id}: exams run in isolated mode only")
+        if instrument.is_exam and args.framing != "own-view":
+            sys.exit(f"{instrument.id}: exams have no --framing; the question is what is correct")
         # A non-default framing is a different measurement; label it so
         # reports keep it apart from the plain run.
         label = spec if args.framing == "own-view" else f"{spec}/{args.framing}"
@@ -165,6 +169,8 @@ def cmd_run(args):
                 "score": score,
                 "trace": outcome["trace"] if args.trace else None,
             })
+            if "orders" in outcome:
+                results[-1]["orders"] = outcome["orders"]
             if "distributions" in outcome:
                 # Judgement models report a distribution per item; score that
                 # too, alongside the top-level picks every other model gets.
@@ -181,15 +187,17 @@ def cmd_run(args):
                 flags.append(f"{len(outcome['errored'])} ERRORED")
             note = f"  ({', '.join(flags)})" if flags else ""
             summary = ", ".join(
-                f"{instrument.traits[t]['label']} {v:+.2f}"
+                f"{instrument.traits[t]['label']} {report.fmt(instrument, v)}"
                 for t, v in point.items() if v is not None)
             if instrument.report["type"] == "dichotomy":
                 summary = f"{scoring.type_code(instrument, point)} — {summary}"
             print(f"    -> {summary}{note}")
             if "score_expected" in results[-1]:
                 weighted = results[-1]["score_expected"]["point"]
-                print("       probability-weighted: " + ", ".join(
-                    f"{instrument.traits[t]['label']} {v:+.2f}"
+                label = ("probability on the key" if instrument.is_exam
+                         else "probability-weighted")
+                print(f"       {label}: " + ", ".join(
+                    f"{instrument.traits[t]['label']} {report.fmt(instrument, v)}"
                     for t, v in weighted.items() if v is not None))
             compass.save(out_path, {"generated": _stamp(), "results": results})
 
@@ -275,7 +283,7 @@ def build_parser():
     run.add_argument("--seed", type=int, default=1)
     run.add_argument("--concurrency", type=int, default=1,
                      help="parallel requests per model (isolated mode only)")
-    run.add_argument("--framing", choices=list(instruments.FRAMINGS), default="own-view",
+    run.add_argument("--framing", choices=instruments.SELECTABLE_FRAMINGS, default="own-view",
                      help="whose answer a judgement model is asked for (typesafe only)")
     run.add_argument("--trace", action="store_true", help="store every raw reply")
     run.add_argument("--title", default=None)

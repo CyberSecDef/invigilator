@@ -550,6 +550,91 @@ def fetch_dirty_dozen() -> dict:
     }
 
 
+# Pinned so the item set cannot shift under a comparison. The SAT files were
+# last changed in 4673402 (2024-06-07); this is the head that contains them.
+AGIEVAL = ("https://raw.githubusercontent.com/ruixiangcui/AGIEval/"
+           "84ab72d94318290aad2e4ec820d535a95a1f7552/data/v1_1/{}.jsonl")
+SAT_SECTIONS = [  # (AGIEval file, section, key prefix, expected items)
+    ("sat-math", "math", "math", 220),
+    ("sat-en", "reading", "read", 206),
+]
+_OPTION = re.compile(r"^\s*\(([A-J])\)\s*", re.S)
+
+# Items dropped at build time, each found by reading the source rather than by
+# pattern: a question that needs a graph or table AGIEval does not carry, or
+# text with page furniture spliced into it. Keys keep their source numbering,
+# so dropping one never renumbers the rest.
+_MISSING = "needs a graph or table that is not in the source"
+SAT_EXCLUDED = {
+    "math-002": "choice D ends in a stray page number",
+    "math-134": "choice D ends in a stray 'DIRECTIONS' heading",
+    "math-171": "choice D ends in a stray 'DIRECTIONS' heading",
+    "read-124": _MISSING, "read-125": _MISSING,
+    "read-138": _MISSING, "read-139": _MISSING, "read-140": _MISSING,
+    "read-165": _MISSING, "read-166": _MISSING,
+    "read-194": _MISSING, "read-195": _MISSING,
+    **{f"read-{n}": "passage contains a page footer ('Unauthorized copying... CONTINUE')"
+       for n in range(187, 191)},
+}
+
+
+def fetch_sat() -> dict:
+    items = []
+    for name, section, prefix, expected in SAT_SECTIONS:
+        rows = [json.loads(line) for line in get(AGIEVAL.format(name)).splitlines()
+                if line.strip()]
+        if len(rows) != expected:
+            raise FetchError(f"{name}: expected {expected} items, got {len(rows)}")
+        for number, row in enumerate(rows, 1):
+            choices = {}
+            for option in row["options"]:
+                match = _OPTION.match(option)
+                if not match:
+                    raise FetchError(f"{name} #{number}: unlabelled option {option[:40]!r}")
+                choices[match.group(1)] = option[match.end():].strip()
+            item = {"key": f"{prefix}-{number:03d}", "trait": section,
+                    "stem": row["question"].strip(), "choices": choices,
+                    "answer": row["label"].strip()}
+            if row.get("passage", "").strip():
+                item["passage"] = row["passage"].strip()
+            items.append(item)
+    unknown = set(SAT_EXCLUDED) - {item["key"] for item in items}
+    if unknown:
+        raise FetchError(f"sat: exclusions name items that do not exist: {sorted(unknown)}")
+    items = [item for item in items if item["key"] not in SAT_EXCLUDED]
+    return {
+        "id": "sat",
+        "name": "SAT questions (AGIEval)",
+        "source": "https://github.com/ruixiangcui/AGIEval",
+        "citation": ("Zhong, W. et al. (2023). AGIEval: A Human-Centric Benchmark for "
+                     "Evaluating Foundation Models. Items drawn from official SAT "
+                     "practice material."),
+        "note": ("Multiple-choice items from AGIEval's sat-math and sat-en sets, as "
+                 "published (MIT licence), with answer keys as published. Items are "
+                 "never edited; the few that need a missing graph or table, or carry "
+                 "page furniture from the source PDFs, are dropped instead (see "
+                 "`excluded`). Reading passages keep their original line numbers, and "
+                 "some show line breaks as '.'; both come from the source. The items come from several different tests, so there is "
+                 "no raw-to-scaled conversion: scores are percent correct, not "
+                 "200-800 section scores. These questions are public and very likely "
+                 "in training data; read high scores with that in mind."),
+        "prompt_style": "multiple_choice",
+        "framing": "exam",
+        # Choices are lettered per item; the scale just names the letters so
+        # the generic tooling (listing, validation) has something to show.
+        "scale": {"min": 1, "points": 4, "labels": ["A", "B", "C", "D"]},
+        "traits": {
+            "overall": {"label": "Overall", "range": [0, 100]},
+            "math": {"label": "Math", "range": [0, 100]},
+            "reading": {"label": "Reading", "range": [0, 100]},
+        },
+        "scoring": {"type": "answer_key", "overall": "overall"},
+        "report": {"type": "bars", "unit": "%"},
+        "excluded": SAT_EXCLUDED,
+        "items": items,
+    }
+
+
 FETCHERS = {
     "political-compass": fetch_political_compass,
     "big-five": fetch_big_five,
@@ -559,6 +644,7 @@ FETCHERS = {
     "sd3": fetch_sd3,
     "dirty-dozen": fetch_dirty_dozen,
     "oejts": fetch_oejts,
+    "sat": fetch_sat,
 }
 
 NEEDS_CONVERTER = {"hexaco": "a .doc converter (antiword, catdoc or libreoffice)",

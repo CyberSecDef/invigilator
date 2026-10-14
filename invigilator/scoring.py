@@ -7,6 +7,8 @@ Two scoring models cover the shipped instruments:
   measured_weights  Each answer carries a measured per-axis weight; the axis
                     score is a normalised sum. Used by the Political Compass,
                     whose key is recovered by `invigilate calibrate`.
+  answer_key        Each item has one keyed answer; a section's score is the
+                    percentage answered correctly. Used by exams.
 
 Both report the same shape, including the interval a score would span if every
 unanswered item had gone either way. Refusals widen the bounds; they are never
@@ -74,10 +76,56 @@ def score_measured_weights(instrument, answers: dict, omitted: list | None = Non
             "omitted": result["omitted"], "sum": result["sum"]}
 
 
+def score_answer_key(instrument, answers: dict, omitted: list | None = None,
+                     credit: dict | None = None) -> dict:
+    """Percent correct per section, plus an optional overall across all items.
+
+    The SAT has no guessing penalty, so an unanswered item is simply wrong and
+    the point score counts it that way. The bounds still show what the
+    unanswered items were worth: the upper bound is the score had every one of
+    them been right. `credit` replaces right/wrong with a per-item fraction --
+    the probability a judgement model put on the keyed answer.
+    """
+    omitted = set(omitted or [])
+    overall = instrument.scoring.get("overall")
+    sections = [t for t in instrument.traits if t != overall]
+    earned = {t: 0.0 for t in sections}
+    total = {t: 0 for t in sections}
+    missing = {t: 0 for t in sections}
+
+    for item in instrument.items:
+        section = item.get("trait")
+        if section is None:
+            continue
+        total[section] += 1
+        if item["key"] in omitted or item["key"] not in answers:
+            missing[section] += 1
+        elif credit is not None:
+            earned[section] += credit[item["key"]]
+        elif answers[item["key"]] == item["answer"]:
+            earned[section] += 1
+
+    groups = {overall: sections} if overall else {}
+    groups.update({t: [t] for t in sections})
+    point, bounds, correct = {}, {}, {}
+    for name, members in groups.items():
+        n = sum(total[t] for t in members)
+        got = sum(earned[t] for t in members)
+        gap = sum(missing[t] for t in members)
+        point[name] = round(100 * got / n, 4) if n else None
+        if n:
+            bounds[name] = [point[name], round(100 * (got + gap) / n, 4)]
+        correct[name] = [round(got, 4), n]
+    return {"point": point, "bounds": bounds, "correct": correct,
+            "omitted": sorted(omitted)}
+
+
 def score(instrument, answers: dict, omitted: list | None = None) -> dict:
     kind = instrument.scoring["type"]
     if kind == "trait_mean":
         result = score_trait_mean(instrument, answers, omitted)
+    elif kind == "answer_key":
+        result = score_answer_key(instrument, answers, omitted)
     elif kind == "measured_weights":
         result = score_measured_weights(instrument, answers, omitted)
     else:
@@ -93,8 +141,15 @@ def score_expected(instrument, distributions: dict, omitted: list | None = None)
     the top level throws that away and lets near-ties flip between runs; this
     keeps it. Trait means take each item's expected value (reverse-keying is
     linear, so it commutes with the expectation); the compass takes each item's
-    expected weight.
+    expected weight; an exam credits each item with the probability placed on
+    its keyed answer.
     """
+    if instrument.scoring["type"] == "answer_key":
+        credit = {k: d.get(instrument.by_key(k)["answer"], 0.0)
+                  for k, d in distributions.items()}
+        result = score_answer_key(instrument, distributions, omitted, credit)
+        result["n_questions"] = len(instrument.items)
+        return result
     if instrument.scoring["type"] == "trait_mean":
         means = {k: sum(v * p for v, p in d.items()) for k, d in distributions.items()}
         return score(instrument, means, omitted)

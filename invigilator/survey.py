@@ -63,7 +63,37 @@ SYSTEM_PER_ITEM = (
 )
 
 
+# Exams are a different task from questionnaires: there is a right answer, and
+# a model that reasons first should be allowed to. The answer goes on a final
+# line so working cannot be mistaken for it.
+EXAM_SYSTEM = (
+    "You are taking a standardized test. Each question has exactly one correct "
+    "answer among the lettered choices. Work through the problem as much as you "
+    "need, then finish with a final line of the form `Answer: X`, where X is the "
+    "letter of your choice."
+)
+
+EXAM_NUDGES = [
+    "",
+    "\n\nEnd your reply with a final line `Answer: X`, where X is one of {choices}.",
+    "\n\nYour previous reply did not end with a usable answer. Reply with the single "
+    "letter ({choices}) of the choice you think is correct, and nothing else.",
+]
+
+# Room to reason. Questionnaire items are one-line judgements; exam items are not,
+# and a reply cut off before its answer line scores as unanswered.
+EXAM_MAX_TOKENS = 12000
+
+# Only the word "answer" ignores case: the letter must be a capital, or "the
+# answer is a function of x" would read as choice A.
+_ANSWER_LINE = re.compile(
+    r"(?i:\banswer)\s*(?:(?i:is)|:)?\s*[:\-]?\s*\**\s*\(?([A-J])\)?(?![A-Za-z])")
+_BARE_LETTER = re.compile(r"^\W*\(?([A-J])\)?\W*$", re.I)
+
+
 def build_system(instrument) -> str:
+    if instrument.is_exam:
+        return EXAM_SYSTEM
     if instrument.style.describes_own_scale:
         return SYSTEM_PER_ITEM.format(points=instrument.points)
     neutrality = "" if instrument.points % 2 else "There is no neutral option and no abstention. "
@@ -96,11 +126,40 @@ def parse_answer(text: str, instrument):
     return None
 
 
+def parse_choice(text: str, item: dict):
+    """Map an exam reply onto the source letter it chose, or None.
+
+    The last `Answer: X` wins -- models sometimes restate a rejected option
+    while working -- and a reply that is nothing but a letter counts too. The
+    letter is the one displayed, so it is mapped back through the item's
+    presentation order before scoring.
+    """
+    if not text:
+        return None
+    from .instrument import MultipleChoiceStyle
+    shown = {display: source for display, source, _ in MultipleChoiceStyle.shown(item)}
+    found = _ANSWER_LINE.findall(text)
+    if found:
+        letter = found[-1].upper()
+    else:
+        bare = _BARE_LETTER.match(text.strip())
+        if not bare:
+            return None
+        letter = bare.group(1).upper()
+    return shown.get(letter)
+
+
 def looks_like_refusal(text: str) -> bool:
     return bool(text) and bool(_REFUSAL_HINT.search(text))
 
 
 def _prompt_for(instrument, item, nudge: int) -> str:
+    if instrument.is_exam:
+        from .instrument import MultipleChoiceStyle
+        choices = ", ".join(shown for shown, _, _ in MultipleChoiceStyle.shown(item))
+        nudges = EXAM_NUDGES
+        return (instrument.render_item(item)
+                + nudges[min(nudge, len(nudges) - 1)].format(choices=choices))
     choices = ", ".join(str(v) for v in instrument.values())
     body = (
         f"{instrument.render_item(item)}\n\n"
@@ -117,11 +176,18 @@ def ask_isolated(provider, model, instrument, item, max_nudges=3, max_errors=5, 
     and never counts as a refusal.
     """
     system = build_system(instrument)
+    if instrument.is_exam:
+        budget, extra = EXAM_MAX_TOKENS, {"deliberate": True}
+        read = lambda text: parse_choice(text, item)
+    else:
+        budget, extra = 1500, {}
+        read = lambda text: parse_answer(text, instrument)
     attempts = []
     nudge = errors = 0
     while nudge < max_nudges:
         try:
-            reply = provider.complete(model, system, _prompt_for(instrument, item, nudge), 1500)
+            reply = provider.complete(
+                model, system, _prompt_for(instrument, item, nudge), budget, **extra)
         except providers.ProviderError as exc:
             errors += 1
             attempts.append({"error": str(exc)[:300], "status": exc.status})
@@ -135,10 +201,11 @@ def ask_isolated(provider, model, instrument, item, max_nudges=3, max_errors=5, 
             time.sleep(delay)
             continue
 
-        answer = None if reply.hard_refusal else parse_answer(reply.text, instrument)
+        answer = None if reply.hard_refusal else read(reply.text)
         attempts.append({
             "nudge": nudge,
-            "reply": reply.text[:600],
+            # Exam replies carry working; keep the tail, where the answer is.
+            "reply": reply.text[-2000:] if instrument.is_exam else reply.text[:600],
             "stop_reason": reply.stop_reason,
             "parsed": answer,
         })
@@ -170,6 +237,27 @@ def read_judgement(answer: dict, instrument):
     return instrument.minimum + level, instrument.minimum + float(expected)
 
 
+def read_exam_judgement(answer: dict, item: dict):
+    """Map a Score answer over an exam item's choices onto source letters.
+
+    Returns (picked letter, probability on the keyed answer, {letter: p}). The
+    probability on the right answer is the exam's analogue of the expected
+    position: how much of the model's belief landed where it should.
+    """
+    from .instrument import MultipleChoiceStyle
+    sources = [source for _, source, _ in MultipleChoiceStyle.shown(item)]
+    distribution = {}
+    for k, p in (answer.get("probabilities") or {}).items():
+        index = int(k)
+        if 0 <= index < len(sources):
+            distribution[sources[index]] = float(p)
+    if not distribution:
+        return None, None, {}
+    # Ties go to the earlier displayed choice, matching read_judgement.
+    picked = max(sources, key=lambda s: distribution.get(s, 0.0))
+    return picked, distribution.get(item["answer"], 0.0), distribution
+
+
 def ask_structured(provider, model, instrument, item, max_errors=5, log=None,
                    framing="own-view"):
     """Ask one item of a judgement model as a Score question. Same return shape
@@ -196,15 +284,19 @@ def ask_structured(provider, model, instrument, item, max_errors=5, log=None,
             continue
 
         answer = (data.get("answers") or {}).get("response") or {}
-        value, expected = read_judgement(answer, instrument)
+        if instrument.is_exam:
+            value, expected, distribution = read_exam_judgement(answer, item)
+        else:
+            value, expected = read_judgement(answer, instrument)
+            # Keyed by scale value rather than level index, ready for scoring.
+            distribution = {instrument.minimum + int(k): float(v)
+                            for k, v in (answer.get("probabilities") or {}).items()}
         attempts.append({
             "model": data.get("model"),
             "parsed": value,
             "expected": expected,
             "probabilities": answer.get("probabilities"),
-            # Keyed by scale value rather than level index, ready for scoring.
-            "distribution": {instrument.minimum + int(k): float(v)
-                             for k, v in (answer.get("probabilities") or {}).items()},
+            "distribution": distribution,
             "confidence": answer.get("confidence"),
             "usage": data.get("usage"),
         })
@@ -275,6 +367,8 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
     if structured and mode == "batch":
         raise ValueError("batch mode needs a shared context window; "
                          "judgement models are asked in isolated mode only")
+    if instrument.is_exam and mode == "batch":
+        raise ValueError("exams run in isolated mode only: each item needs room to work")
     if structured:
         def asker(*args, **kwargs):
             return ask_structured(*args, framing=framing, **kwargs)
@@ -289,7 +383,7 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
         refused, errored = ([], missing) if failed else (missing, [])
         trace = {"batch": attempts, "order": order}
     else:
-        order = list(instrument.items)
+        order = [instrument.present(item, seed) for item in instrument.items]
         rng.shuffle(order)
         concurrency = max(1, min(concurrency, provider.max_concurrency))
         lock = threading.Lock()
@@ -325,6 +419,10 @@ def run_once(provider, model, instrument, mode, seed, concurrency=1, log=None,
 
     outcome = {"answers": answers, "refused": refused, "errored": errored,
                "trace": trace, "mode": mode, "seed": seed}
+    if instrument.is_exam:
+        # The order each item's choices were shown in, so any reply in the
+        # trace can be read back against what the model actually saw.
+        outcome["orders"] = {item["key"]: item["_order"] for item in order}
     if structured:
         outcome["expected"] = expected
         outcome["distributions"] = distributions

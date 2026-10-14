@@ -422,9 +422,11 @@ class JudgementModels(unittest.TestCase):
     def test_framings_change_only_the_instructions(self):
         for name in instrument.available():
             ins = instrument.load(name)
+            if ins.is_exam:       # one framing only; see Exams
+                continue
             item = ins.items[0]
             base_state, base_text, base_levels = ins.judgement(item)
-            for framing in instrument.FRAMINGS:
+            for framing in instrument.SELECTABLE_FRAMINGS:
                 state, text, levels = ins.judgement(item, framing)
                 self.assertEqual((state, levels), (base_state, base_levels), f"{name}/{framing}")
                 for path in state:
@@ -456,6 +458,165 @@ class JudgementModels(unittest.TestCase):
         self.assertTrue(provider.structured)
         self.assertEqual(model, "jev-latest")
         self.assertFalse(providers.resolve("openai")[0].structured)
+
+
+def tiny_exam():
+    """A three-item exam built in memory, so these tests need no fetch."""
+    return instrument.Instrument({
+        "id": "tiny-exam", "name": "Tiny exam", "prompt_style": "multiple_choice",
+        "framing": "exam",
+        "scale": {"min": 1, "points": 4, "labels": ["A", "B", "C", "D"]},
+        "traits": {"overall": {"label": "Overall", "range": [0, 100]},
+                   "math": {"label": "Math", "range": [0, 100]},
+                   "reading": {"label": "Reading", "range": [0, 100]}},
+        "scoring": {"type": "answer_key", "overall": "overall"},
+        "report": {"type": "bars", "unit": "%"},
+        "items": [
+            {"key": "m1", "trait": "math", "stem": "2 + 2 = ?", "answer": "C",
+             "choices": {"A": "3", "B": "5", "C": "4", "D": "22"}},
+            {"key": "m2", "trait": "math", "stem": "3 x 3 = ?", "answer": "A",
+             "choices": {"A": "9", "B": "6", "C": "33", "D": "1"}},
+            {"key": "r1", "trait": "reading", "stem": "What colour is the sky?",
+             "passage": "The sky was blue.", "answer": "B",
+             "choices": {"A": "green", "B": "blue", "C": "red", "D": "grey"}},
+        ],
+    })
+
+
+class Exams(unittest.TestCase):
+    def setUp(self):
+        self.exam = tiny_exam()
+
+    def test_tiny_exam_validates_and_bad_keys_are_caught(self):
+        self.assertEqual(self.exam.validate(), [])
+        spec = dict(self.exam.spec)
+        spec["items"] = [dict(spec["items"][0], answer="E")]
+        self.assertTrue(any("not a choice" in p
+                            for p in instrument.Instrument(spec).validate()))
+
+    def test_choice_order_is_seeded_per_item_and_maps_back(self):
+        item = self.exam.items[0]
+        first = self.exam.present(item, seed=1)
+        self.assertEqual(first["_order"], self.exam.present(item, seed=1)["_order"])
+        orders = {tuple(self.exam.present(item, seed=s)["_order"]) for s in range(20)}
+        self.assertGreater(len(orders), 1, "choices never move")
+        # Whatever letter "4" is shown under, choosing it scores as the key.
+        shown = next(d for d, src, _ in instrument.MultipleChoiceStyle.shown(first)
+                     if src == "C")
+        self.assertEqual(survey.parse_choice(f"Answer: {shown}", first), "C")
+
+    def test_presentation_leaves_questionnaires_alone(self):
+        sd3 = instrument.load("sd3")
+        self.assertIs(sd3.present(sd3.items[0], 1), sd3.items[0])
+
+    def test_last_answer_line_wins_and_bare_letters_count(self):
+        item = self.exam.items[0]       # unshuffled: displayed letter == source
+        cases = [
+            ("Work... Answer: B", "B"),
+            ("I first thought Answer: A, but no.\n\nAnswer: D", "D"),
+            ("**Answer: (C)**", "C"),
+            ("The answer is C.", "C"),
+            ("c", "C"),
+            ("(D)", "D"),
+            ("", None),
+            ("It could be A or B.", None),
+            ("Answer: E", None),            # not a choice on this item
+            ("A plausible approach is to factor.", None),
+            ("The answer is a function of x.", None),
+            ("ANSWER: B", "B"),
+        ]
+        for text, expected in cases:
+            self.assertEqual(survey.parse_choice(text, item), expected, text)
+
+    def test_exam_prompts_ask_for_correctness_not_opinion(self):
+        system = survey.build_system(self.exam)
+        self.assertIn("correct answer", system)
+        self.assertNotIn("own view", system)
+        body = survey._prompt_for(self.exam, self.exam.items[2], 0)
+        self.assertIn("The sky was blue.", body)
+        self.assertIn("B) blue", body)
+        _, instructions, levels = self.exam.judgement(self.exam.items[2])
+        self.assertIn("standardized test", instructions)
+        self.assertIn("`passage`", instructions)
+        self.assertEqual(len(levels), 4)
+
+    def test_exams_refuse_batch_mode_and_other_framings(self):
+        with self.assertRaises(ValueError):
+            self.exam.judgement(self.exam.items[0], "typical")
+        with self.assertRaises(ValueError):
+            survey.run_once(FakeJev({0: 1.0}), "m", self.exam, "batch", seed=1)
+
+    def test_scoring_counts_unanswered_as_wrong_and_bounds_show_their_worth(self):
+        result = scoring.score(self.exam, {"m1": "C", "m2": "B"}, omitted=["r1"])
+        self.assertAlmostEqual(result["point"]["math"], 50.0)
+        self.assertAlmostEqual(result["point"]["reading"], 0.0)
+        self.assertAlmostEqual(result["point"]["overall"], 100 / 3, places=3)
+        self.assertEqual(result["bounds"]["reading"], [0.0, 100.0])
+        self.assertEqual(result["correct"]["overall"], [1.0, 3])
+
+    def test_a_chat_model_run_reasons_and_scores(self):
+        class Solver:
+            """Always picks whichever displayed letter holds the right answer."""
+            max_concurrency = 1
+
+            def __init__(self, exam):
+                self.exam, self.calls = exam, []
+
+            def complete(self, model, system, user, max_tokens, deliberate=False):
+                self.calls.append((max_tokens, deliberate))
+                right = {"2 + 2": "4", "3 x 3": "9", "sky": "blue"}
+                want = next(v for k, v in right.items() if k in user)
+                letter = next(line.split(")")[0].strip() for line in user.splitlines()
+                              if line.strip().endswith(f") {want}"))
+                return providers.Reply(text=f"Thinking it over.\nAnswer: {letter}")
+
+        solver = Solver(self.exam)
+        outcome = survey.run_once(solver, "m", self.exam, "isolated", seed=7)
+        self.assertEqual(outcome["answers"], {"m1": "C", "m2": "A", "r1": "B"})
+        self.assertEqual(set(outcome["orders"]), {"m1", "m2", "r1"})
+        self.assertTrue(all(d and t >= 4000 for t, d in solver.calls))
+        self.assertEqual(scoring.score(self.exam, outcome["answers"])["point"]["overall"], 100)
+
+    def test_jev_picks_map_to_source_letters_and_credit_is_probability_on_key(self):
+        # Jev puts 0.6 on the first displayed level and 0.4 on the second.
+        jev = FakeJev({0: 0.6, 1: 0.4})
+        outcome = survey.run_once(jev, "jev", self.exam, "isolated", seed=3)
+        for key, picked in outcome["answers"].items():
+            order = outcome["orders"][key]
+            self.assertEqual(picked, order[0])
+            self.assertEqual(outcome["distributions"][key], {order[0]: 0.6, order[1]: 0.4,
+                                                             order[2]: 0.0, order[3]: 0.0})
+        weighted = scoring.score_expected(self.exam, outcome["distributions"])
+        expected_credit = sum(outcome["distributions"][i["key"]][i["answer"]]
+                              for i in self.exam.items) / 3 * 100
+        self.assertAlmostEqual(weighted["point"]["overall"], expected_credit, places=3)
+
+    def test_exam_scores_report_as_percentages(self):
+        runs = [{"label": "m", "provider": "p", "model": "m", "mode": "isolated",
+                 "answers": {"m1": "C", "m2": "A", "r1": "A"}, "refused": [],
+                 "errored": [],
+                 "score": scoring.score(self.exam, {"m1": "C", "m2": "A", "r1": "A"})}]
+        rows = report.aggregate(runs, self.exam)
+        table = report.render_table(rows, self.exam)
+        self.assertIn("66.7%", table)
+        self.assertIn("100.0%", table)
+        self.assertIn("percent correct", report.render_svg(rows, self.exam))
+
+    def test_built_sat_matches_its_source_if_fetched(self):
+        if "sat" not in instrument.available():
+            self.skipTest("run `invigilate fetch sat`")
+        sat = instrument.load("sat")
+        counts = {}
+        for item in sat.items:
+            counts[item["trait"]] = counts.get(item["trait"], 0) + 1
+        self.assertEqual(counts, {"math": 217, "reading": 193})
+        self.assertEqual(sat.validate(), [])
+        keys = set(sat.keys())
+        self.assertFalse(keys & set(sat.spec["excluded"]))
+        for item in sat.items:
+            text = " ".join([item["stem"], item.get("passage", ""), *item["choices"].values()])
+            self.assertNotIn("Unauthorized copying", text, item["key"])
+            self.assertNotIn("DIRECTIONS", text, item["key"])
 
 
 if __name__ == "__main__":

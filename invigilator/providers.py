@@ -128,11 +128,16 @@ class Provider:
                 time.sleep(wait)
             self._next_at = max(now, self._next_at) + self.min_interval
 
-    def complete(self, model: str, system: str, user: str, max_tokens: int) -> Reply:
+    def complete(self, model: str, system: str, user: str, max_tokens: int,
+                 deliberate: bool = False) -> Reply:
+        """`deliberate` asks for the model's full reasoning instead of a quick
+        disposition. Questionnaires leave it off; exams turn it on. Providers
+        without a reasoning control ignore it."""
         self._pace()
-        return self._complete(model, system, user, max_tokens)
+        return self._complete(model, system, user, max_tokens, deliberate=deliberate)
 
-    def _complete(self, model: str, system: str, user: str, max_tokens: int) -> Reply:
+    def _complete(self, model: str, system: str, user: str, max_tokens: int,
+                  deliberate: bool = False) -> Reply:
         raise NotImplementedError
 
     def list_models(self) -> list[str]:
@@ -160,7 +165,7 @@ class Anthropic(Provider):
             self._client = anthropic.Anthropic()
         return self._client
 
-    def _complete(self, model, system, user, max_tokens):
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
         client = self._get_client()
         # Thinking is left at the Opus 5 default (adaptive) and effort is held
         # low: these are one-line judgements, and we want the model's ordinary
@@ -168,14 +173,14 @@ class Anthropic(Provider):
         # fallbacks are deliberately NOT enabled -- silently rerouting a refused
         # item to a different model would corrupt the very thing being measured.
         try:
-            response = self._call(client, model, system, user, max_tokens)
+            response = self._call(client, model, system, user, max_tokens, deliberate)
         except Exception as exc:
             if "effort parameter" in str(exc):
                 # Retry unconditionally, not just for the first caller to notice:
                 # under concurrency every in-flight request trips this together,
                 # and the retry cannot recur because _complete now omits effort.
                 self._no_effort.add(model)
-                return self._complete(model, system, user, max_tokens)
+                return self._complete(model, system, user, max_tokens, deliberate)
             status = getattr(exc, "status_code", None)
             if status is None and not isinstance(exc, ProviderError):
                 raise ProviderError(f"{type(exc).__name__}: {exc}") from None
@@ -193,15 +198,16 @@ class Anthropic(Provider):
             },
         )
 
-    def _call(self, client, model, system, user, max_tokens):
+    def _call(self, client, model, system, user, max_tokens, deliberate=False):
         kwargs = {
             "model": model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
-        if model not in self._no_effort:
+        if model not in self._no_effort and not deliberate:
             # One-line judgements: keep thinking at its default and effort low.
+            # Deliberate requests (exams) leave effort at the model's default.
             kwargs["output_config"] = {"effort": "low"}
         return client.messages.create(**kwargs)
 
@@ -222,7 +228,7 @@ class OpenAICompatible(Provider):
     def _headers(self):
         return {"Authorization": f"Bearer {os.environ.get(self.key_env, '')}"}
 
-    def _complete(self, model, system, user, max_tokens):
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
         payload = {
             "model": model,
             "messages": [
@@ -268,7 +274,7 @@ class Gemini(Provider):
     def _headers(self):
         return {"x-goog-api-key": os.environ.get(self.key_env, "")}
 
-    def _complete(self, model, system, user, max_tokens):
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -310,14 +316,15 @@ class Ollama(Provider):
     default_model = "gemma4:26b"
     base_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 
-    def _complete(self, model, system, user, max_tokens):
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
         payload = {
             "model": model,
             "stream": False,
             # Local reasoning models (gemma4 among them) will otherwise spend the
             # entire token budget thinking and return empty content, which reads
-            # as a refusal when it is nothing of the sort.
-            "think": False,
+            # as a refusal when it is nothing of the sort. Deliberate requests
+            # (exams) get the room to think that this switch otherwise denies.
+            "think": deliberate,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -364,7 +371,7 @@ class TypeSafe(Provider):
     def _headers(self):
         return {"Authorization": f"Bearer {os.environ.get(self.key_env, '')}"}
 
-    def _complete(self, model, system, user, max_tokens):
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
         raise ProviderError("typesafe models answer typed questions, not prompts", status=400)
 
     def judge(self, model: str, state: dict, questions: dict) -> dict:

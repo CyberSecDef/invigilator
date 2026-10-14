@@ -14,6 +14,7 @@ not code.
 | `sd3` | 27 | 5-point agreement | Machiavellianism / Narcissism / Psychopathy |
 | `dirty-dozen` | 12 | 5-point agreement | The same three traits, 12 items |
 | `oejts` | 32 | 5-point bipolar | Four dichotomies + a four-letter type |
+| `sat` | 410 | 4-choice, keyed | Percent correct: Math, Reading, Overall |
 
 ```bash
 invigilate instruments                               # what's available
@@ -129,6 +130,43 @@ between calls, which is enough to flip a near-tie pick, so keep `--repeats`.
 The weighted score barely moves when that happens. Two more differences: it
 cannot refuse, so its refusal count is zero by construction, and it runs in
 isolated mode only. Key: `TYPESAFE_API_KEY`.
+
+## Exams: `sat`
+
+`sat` is the odd one out: questions with right answers, not a questionnaire.
+Items are AGIEval's `sat-math` and `sat-en` sets, pinned to a commit and
+fetched like everything else. Sixteen are dropped at build time, never edited:
+nine reading questions that need a graph or table the source does not carry,
+and seven whose text has page furniture from the original PDFs spliced in.
+That leaves 217 math and 193 reading. Each exclusion and its reason is listed
+in `SAT_EXCLUDED` and saved in the built file. The English set is reading
+comprehension only, hence "Reading" rather than the current test's "Reading
+and Writing".
+
+```bash
+invigilate fetch sat
+invigilate run typesafe anthropic -i sat --repeats 3 --concurrency 6
+```
+
+What changes for an exam:
+
+- **Framing.** The system prompt asks for the correct answer, not the
+  respondent's view, and `--framing` is refused. Jev gets the same wording.
+- **Room to reason.** Chat models are asked deliberately: Anthropic drops the
+  low-effort setting, Ollama turns thinking on, and the token budget rises to
+  12k. The reply must end with `Answer: X`; the last such line wins.
+- **Shuffled choices.** Each item's choices are reordered per seed (the same
+  order for every model), so a model that favours one letter shows up as
+  spread across repeats instead of a fixed bias. Each run saves the orders.
+- **Scoring.** Percent correct per section. The SAT has no guessing penalty,
+  so an unanswered item is wrong; the upper bound shows what the unanswered
+  items were worth. For Jev, `score_expected` credits each item with the
+  probability placed on the keyed answer.
+- **Isolated mode only.**
+
+Two caveats travel with the numbers. The items come from several different
+tests, so there is no raw-to-scaled table and no 1600-point score. And they are
+public SAT practice questions, very likely in every model's training data.
 
 ## The two modes, and why
 

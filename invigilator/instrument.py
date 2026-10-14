@@ -17,6 +17,7 @@ Three ship with the tool:
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,13 @@ class Instrument:
         self.report = spec["report"]
         self.prompt_style = spec.get("prompt_style", "likert")
         self.sections = spec.get("sections", {})
+        # "questionnaire" asks for the respondent's own view; "exam" asks for the
+        # correct answer and lets the model work before committing to one.
+        self.framing = spec.get("framing", "questionnaire")
+
+    @property
+    def is_exam(self) -> bool:
+        return self.framing == "exam"
 
     # -- scale helpers ----------------------------------------------------
     @property
@@ -84,6 +92,11 @@ class Instrument:
         """The body of a single question, in whichever style this instrument uses."""
         return self.style.render(self, item)
 
+    def present(self, item: dict, seed: int) -> dict:
+        """The item as this run will show it -- for exams, with its choices in a
+        seeded order. Anything else comes back unchanged."""
+        return self.style.present(self, item, seed)
+
     def item_summary(self, item: dict) -> str:
         """Short human-readable form, for reports and logs."""
         return self.style.summary(self, item)
@@ -99,6 +112,10 @@ class Instrument:
         supplies the question itself, phrased to the respondent; the framing
         says who that respondent is.
         """
+        if self.is_exam:
+            if framing != "own-view":
+                raise ValueError("exam instruments have one framing: the correct answer")
+            framing = "exam"
         try:
             preamble, closer = FRAMINGS[framing]
         except KeyError:
@@ -120,7 +137,7 @@ class Instrument:
             problems.append(str(exc))
         else:
             problems.extend(self.style.validate(self))
-        if self.scoring["type"] == "trait_mean":
+        if self.scoring["type"] in ("trait_mean", "answer_key"):
             for item in self.items:
                 # A null trait marks an unscored item -- attention checks are asked
                 # but deliberately contribute to nothing.
@@ -142,6 +159,9 @@ class PromptStyle:
 
     def summary(self, instrument, item):
         return item["text"]
+
+    def present(self, instrument, item, seed):
+        return item
 
     def judgement(self, instrument, item):
         raise NotImplementedError
@@ -249,6 +269,65 @@ class SectionedLikertStyle(PromptStyle):
         return problems
 
 
+class MultipleChoiceStyle(PromptStyle):
+    """A question with one keyed answer among lettered choices.
+
+    Each item carries `choices` ({letter: text}) and `answer` (a letter), plus an
+    optional `passage`. `present()` reorders the choices per seed so that a
+    model leaning towards one letter shows up as noise across repeats rather
+    than as a fixed bias; the displayed letters are always A, B, C... and
+    `_order` maps each back to the source letter that gets scored.
+    """
+
+    required = ("stem", "choices", "answer")
+    describes_own_scale = True
+
+    def present(self, instrument, item, seed):
+        order = list(item["choices"])
+        random.Random(f"{seed}:{item['key']}").shuffle(order)
+        return dict(item, _order=order)
+
+    @staticmethod
+    def shown(item):
+        """[(displayed letter, source letter, text)] in presentation order."""
+        order = item.get("_order") or list(item["choices"])
+        return [(LETTERS[i], source, item["choices"][source])
+                for i, source in enumerate(order)]
+
+    def render(self, instrument, item):
+        parts = []
+        if item.get("passage"):
+            parts.append(f"Passage:\n{item['passage']}\n")
+        parts.append(f"Question: {item['stem']}\n")
+        parts.extend(f"  {shown}) {text}" for shown, _, text in self.shown(item))
+        return "\n".join(parts)
+
+    def summary(self, instrument, item):
+        return item["stem"]
+
+    def judgement(self, instrument, item):
+        state = {"question": item["stem"]}
+        instructions = "Which choice correctly answers `question`?"
+        if item.get("passage"):
+            state["passage"] = item["passage"]
+            instructions = "Using `passage`, which choice correctly answers `question`?"
+        levels = [f"{shown}) {text}" for shown, _, text in self.shown(item)]
+        return state, instructions, levels
+
+    def validate(self, instrument):
+        problems = super().validate(instrument)
+        for item in instrument.items:
+            choices = item.get("choices") or {}
+            if item.get("answer") not in choices:
+                problems.append(f"{item['key']}: answer {item.get('answer')!r} is not a choice")
+            if not 2 <= len(choices) <= len(LETTERS):
+                problems.append(f"{item['key']}: {len(choices)} choices")
+        return problems
+
+
+LETTERS = "ABCDEFGHIJ"   # Score questions take at most ten levels
+
+
 def _respondent(who: str) -> tuple[str, str]:
     return (
         f"A personality and attitudes questionnaire is being completed by {who}; "
@@ -276,13 +355,23 @@ FRAMINGS = {
     ),
     "progressive": _respondent("a committed political progressive"),
     "conservative": _respondent("a committed political conservative"),
+    # Not selectable: exam instruments use it automatically.
+    "exam": (
+        "You are taking a standardized test. Each question has exactly one "
+        "correct answer.",
+        "Choose the correct answer.",
+    ),
 }
+
+# What `--framing` may choose from; "exam" follows from the instrument.
+SELECTABLE_FRAMINGS = [name for name in FRAMINGS if name != "exam"]
 
 
 STYLES = {
     "likert": LikertStyle(),
     "bipolar": BipolarStyle(),
     "sectioned_likert": SectionedLikertStyle(),
+    "multiple_choice": MultipleChoiceStyle(),
 }
 
 

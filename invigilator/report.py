@@ -18,6 +18,13 @@ SERIES = ["#111111", "#e8590c", "#1971c2", "#2f9e44", "#ae3ec9",
           "#c92a2a", "#0c8599", "#f08c00", "#5f3dc4", "#495057"]
 
 
+def fmt(instrument, value) -> str:
+    """A score as the instrument reports it: signed trait positions, or percent."""
+    if instrument is not None and instrument.report.get("unit") == "%":
+        return f"{value:.1f}%"
+    return f"{value:+.2f}"
+
+
 def partition(results: list) -> tuple[list, list]:
     usable, unusable = [], []
     for run in results:
@@ -59,7 +66,10 @@ def aggregate(results: list, instrument=None) -> list:
         rows.append(row)
 
     first = traits[0]
-    return sorted(rows, key=lambda r: r["traits"].get(first, {}).get("mean", 0))
+    # Exams read best-first; trait instruments read along their axis.
+    best_first = bool(instrument and instrument.is_exam)
+    return sorted(rows, key=lambda r: r["traits"].get(first, {}).get("mean", 0),
+                  reverse=best_first)
 
 
 # --------------------------------------------------------------------------
@@ -153,10 +163,12 @@ def render_bars(rows, instrument, title):
                 x1 = left + (spread[1] - lo) / (hi - lo) * width
                 out.append(f'<line x1="{x0:.1f}" y1="{y+8:.0f}" x2="{x1:.1f}" y2="{y+8:.0f}" '
                            f'stroke="#111" stroke-width="1.4" opacity="0.6"/>')
+            shown = fmt(instrument, value) if instrument.is_exam else f"{value:.2f}"
             out.append(f'<text x="{left+width+8}" y="{y+12:.0f}" font-size="12" '
-                       f'fill="#222">{value:.2f}</text>')
+                       f'fill="#222">{shown}</text>')
+    scale = "percent correct" if instrument.is_exam else f"scale {lo}-{hi}"
     out.append(f'<text x="{left}" y="{height-8}" font-size="11" fill="#777">'
-               f'scale {lo}-{hi}; black line spans repeat runs</text>')
+               f'{scale}; black line spans repeat runs</text>')
     out.append("</svg>")
     return "\n".join(out)
 
@@ -225,7 +237,7 @@ def render_table(rows, instrument):
         cells = []
         for trait in traits:
             value = row["traits"].get(trait)
-            cells.append(f" {value['mean']:+.2f} |" if value else " — |")
+            cells.append(f" {fmt(instrument, value['mean'])} |" if value else " — |")
         spread = ", ".join(
             f"±{row['traits'][t]['sd']:.2f}" for t in traits if t in row["traits"]
         ) if row["n"] > 1 else "—"
