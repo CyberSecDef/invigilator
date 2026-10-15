@@ -5,6 +5,8 @@ providers (OpenAI, DeepSeek, xAI) share one adapter, and Gemini and Ollama get
 thin ones of their own -- all over plain HTTP, since this file is deliberately
 provider-neutral and pulling six vendor SDKs in would not make it clearer.
 TypeSafe is the odd one out: it answers typed questions rather than prompts.
+`claude-cli` drives the Claude Code CLI instead of an API, for comparing what a
+Claude Code subscription answers with what the API does.
 
 Every adapter returns the same `Reply`, and none of them retries on a refusal:
 a refusal is a measurement, not an error.
@@ -15,6 +17,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -381,6 +386,83 @@ class TypeSafe(Provider):
         return _http_json(f"{self.base_url}/systemone", payload, self._headers())
 
 
+class ClaudeCLI(Provider):
+    """Claude through the Claude Code CLI (`claude -p`), on the user's login.
+
+    Each item is one non-interactive session, isolated so the model sees the
+    instrument's prompt and little else: our system prompt replaces Claude
+    Code's, every tool is off (no calculator, no web search, no code), no MCP
+    servers, no setting sources (so no hooks or permissions from the user's
+    settings), no slash commands or skills, no saved session, and an empty
+    working directory so no CLAUDE.md is found. Claude Code still adds a
+    one-line SDK identity, the account's email and an environment block
+    (directory, OS, model, date) -- none of it bears on an answer.
+
+    `--bare` would isolate further but authenticates only by API key, which
+    defeats the purpose. For the same reason ANTHROPIC_API_KEY, which `.env`
+    may have loaded, is removed from the subprocess's environment: the CLI
+    must use the login, not quietly bill the API.
+
+    The CLI takes no token limit, so `max_tokens` is not passed; a deliberate
+    request keeps the model's default effort, a quick one asks for low effort,
+    mirroring the API adapter.
+    """
+
+    name = "claude-cli"
+    key_env = ""
+    max_concurrency = 6
+    default_model = "default"      # whatever the CLI is configured to use
+    timeout = 900
+
+    def __init__(self):
+        super().__init__()
+        self._cwd = None
+
+    def available(self) -> bool:
+        return shutil.which("claude") is not None
+
+    def _complete(self, model, system, user, max_tokens, deliberate=False):
+        if self._cwd is None:
+            self._cwd = tempfile.mkdtemp(prefix="invigilator-cli-")
+        command = [
+            shutil.which("claude") or "claude", "-p", "--output-format", "json",
+            "--system-prompt", system,
+            "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+            "--disable-slash-commands", "--no-session-persistence",
+        ]
+        if model and model != "default":
+            command += ["--model", model]
+        if not deliberate:
+            command += ["--effort", "low"]
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        try:
+            done = subprocess.run(command, input=user, capture_output=True, text=True,
+                                  cwd=self._cwd, env=env, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            raise ProviderError(f"claude -p timed out after {self.timeout}s", status=408) from None
+        try:
+            data = json.loads(done.stdout)
+        except json.JSONDecodeError:
+            raise ProviderError(
+                f"claude -p exit {done.returncode}: {(done.stderr or done.stdout)[:300]}") from None
+        if data.get("is_error"):
+            message = str(data.get("result") or data.get("subtype") or "error")
+            limited = re.search(r"usage limit|rate limit|overloaded|429|529", message, re.I)
+            raise ProviderError(f"claude -p: {message[:300]}", status=429 if limited else None)
+        usage = data.get("usage") or {}
+        return Reply(
+            text=(data.get("result") or "").strip(),
+            stop_reason=data.get("stop_reason") or "",
+            hard_refusal=data.get("stop_reason") == "refusal",
+            usage={"input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
+                   "models": list((data.get("modelUsage") or {})),
+                   "cost_usd": data.get("total_cost_usd")},
+        )
+
+    def list_models(self):
+        return ["default", "opus", "sonnet", "haiku"]
+
+
 def registry() -> dict[str, Provider]:
     return {
         "anthropic": Anthropic(),
@@ -396,6 +478,7 @@ def registry() -> dict[str, Provider]:
         "gemini": Gemini(),
         "ollama": Ollama(),
         "typesafe": TypeSafe(),
+        "claude-cli": ClaudeCLI(),
     }
 
 

@@ -575,6 +575,10 @@ SAT_EXCLUDED = {
     "read-194": _MISSING, "read-195": _MISSING,
     **{f"read-{n}": "passage contains a page footer ('Unauthorized copying... CONTINUE')"
        for n in range(187, 191)},
+    # Found when every model missed it on every run: the stem and choices are a
+    # copy of read-101's (keyed B), while the key (A) and AGIEval's own solution
+    # belong to a different question, about Old Widow Lau, whose text was lost.
+    "read-102": "stem duplicates read-101; its key belongs to a lost question",
 }
 
 

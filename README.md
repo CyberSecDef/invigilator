@@ -14,7 +14,7 @@ not code.
 | `sd3` | 27 | 5-point agreement | Machiavellianism / Narcissism / Psychopathy |
 | `dirty-dozen` | 12 | 5-point agreement | The same three traits, 12 items |
 | `oejts` | 32 | 5-point bipolar | Four dichotomies + a four-letter type |
-| `sat` | 410 | 4-choice, keyed | Percent correct: Math, Reading, Overall |
+| `sat` | 409 | 4-choice, keyed | Percent correct: Math, Reading, Overall |
 | `icar` | 53 | 8-choice, keyed | Percent correct, plus per-item human pass rates |
 | `icar-numbers` | 49 | Write-in numbers | Percent correct, plus per-item Rasch difficulty |
 
@@ -118,6 +118,7 @@ is refused).
 | `gemini` | `generativelanguage` REST | `gemini-3.7-flash` |
 | `ollama` | `/api/chat`, local | `gemma4:26b` |
 | `typesafe` | `/v1/systemone`, Score questions | `jev-latest` |
+| `claude-cli` | the Claude Code CLI (`claude -p`), on your login | the CLI's own default |
 
 `typesafe` is a judgement model, not a chat model: each item goes out as a
 Score question whose levels are the instrument's response labels, and comes
@@ -138,10 +139,12 @@ isolated mode only. Key: `TYPESAFE_API_KEY`.
 Three instruments are tests with right answers rather than questionnaires.
 
 **`sat`** is AGIEval's `sat-math` and `sat-en` sets, pinned to a commit and
-fetched like everything else. Sixteen are dropped at build time, never edited:
-nine reading questions that need a graph or table the source does not carry,
-and seven whose text has page furniture from the original PDFs spliced in.
-That leaves 217 math and 193 reading. Each exclusion and its reason is listed
+fetched like everything else. Seventeen are dropped at build time, never
+edited: nine reading questions that need a graph or table the source does not
+carry, seven whose text has page furniture from the original PDFs spliced in,
+and read-102, a copy of read-101's question carrying another question's key
+(found because every model "missed" it on every run). That leaves 217 math and
+192 reading. Each exclusion and its reason is listed
 in `SAT_EXCLUDED` and saved in the built file. The English set is reading
 comprehension only, hence "Reading" rather than the current test's "Reading
 and Writing".
@@ -231,6 +234,17 @@ table and no 1600-point score. They are also public practice questions, very
 likely in every model's training data. ICAR items are kept off the open web,
 which is the point of registering for them -- and running them through an API
 sends their text to that provider.
+
+`claude-cli` runs each item as an isolated `claude -p` session instead of an
+API call, to compare what a Claude Code subscription answers with what the API
+does. Our system prompt replaces Claude Code's, and tools, MCP servers, setting
+sources (so hooks), slash commands and session saving are all off, in an empty
+working directory so no CLAUDE.md is found. Claude Code still adds a one-line
+SDK identity, the account email and an environment block; none bears on an
+answer. `ANTHROPIC_API_KEY` is stripped from its environment so it uses the
+login rather than billing the API. `--bare` would isolate further but accepts
+only API keys. Expect roughly 5-10 seconds per item, and subscription usage
+limits on long runs: those surface as errors, never as refusals.
 
 ## The two modes, and why
 

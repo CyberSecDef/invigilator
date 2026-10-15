@@ -630,7 +630,7 @@ class Exams(unittest.TestCase):
         counts = {}
         for item in sat.items:
             counts[item["trait"]] = counts.get(item["trait"], 0) + 1
-        self.assertEqual(counts, {"math": 217, "reading": 193})
+        self.assertEqual(counts, {"math": 217, "reading": 192})
         self.assertEqual(sat.validate(), [])
         keys = set(sat.keys())
         self.assertFalse(keys & set(sat.spec["excluded"]))
@@ -762,6 +762,51 @@ class Truncation(unittest.TestCase):
 
     def test_exam_budget_leaves_room_for_hard_items(self):
         self.assertGreaterEqual(survey.EXAM_MAX_TOKENS, 20000)
+
+
+class ClaudeCLIProvider(unittest.TestCase):
+    def test_runs_isolated_on_the_login_not_the_api_key(self):
+        import json, os, subprocess
+        from unittest import mock
+
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen.update(command=command, **kwargs)
+            out = {"result": "Answer: B", "stop_reason": "end_turn", "is_error": False,
+                   "usage": {"input_tokens": 10, "output_tokens": 5},
+                   "modelUsage": {"claude-test": {}}}
+            return subprocess.CompletedProcess(command, 0, json.dumps(out), "")
+
+        cli = providers.ClaudeCLI()
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}), \
+                mock.patch("subprocess.run", fake_run), \
+                mock.patch("shutil.which", return_value="/bin/claude"):
+            reply = cli.complete("default", "SYSTEM", "QUESTION", 20000, deliberate=True)
+        self.assertEqual(reply.text, "Answer: B")
+        command = seen["command"]
+        for flag in ["-p", "--strict-mcp-config", "--disable-slash-commands",
+                     "--no-session-persistence"]:
+            self.assertIn(flag, command)
+        self.assertEqual(command[command.index("--tools") + 1], "")
+        self.assertEqual(command[command.index("--setting-sources") + 1], "")
+        self.assertEqual(command[command.index("--system-prompt") + 1], "SYSTEM")
+        self.assertNotIn("--model", command)         # "default" leaves the CLI's choice
+        self.assertNotIn("--effort", command)        # deliberate keeps default effort
+        self.assertEqual(seen["input"], "QUESTION")
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+        self.assertEqual(os.listdir(seen["cwd"]), [])  # empty dir: no CLAUDE.md
+
+    def test_usage_limits_are_transport_errors_not_refusals(self):
+        import json, subprocess
+        from unittest import mock
+
+        out = {"is_error": True, "result": "Claude usage limit reached. Resets at 5pm."}
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                [], 1, json.dumps(out), "")):
+            with self.assertRaises(providers.ProviderError) as ctx:
+                providers.ClaudeCLI().complete("default", "s", "u", 100)
+        self.assertEqual(ctx.exception.status, 429)
 
 
 class Icar(unittest.TestCase):
